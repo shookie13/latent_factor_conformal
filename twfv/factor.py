@@ -1,5 +1,7 @@
 import torch
 
+from .woodbury import factor_E_step_woodbury, factor_log_likelihood_woodbury, build_pattern_groups, PatternGroup
+
 
 def _mask_observed(M_mask: torch.Tensor, i: int, t: int):
     return torch.nonzero(M_mask[i, t], as_tuple=False).squeeze(1)
@@ -70,4 +72,43 @@ def factor_log_likelihood(
     """
     _, ll = factor_E_step(Y, M_mask, L, psi, s, a2)
     return ll
+
+
+def build_mask_pattern_groups(M_mask: torch.Tensor) -> list[PatternGroup]:
+    """
+    Convenience wrapper to build and cache mask pattern groups (depends only on M_mask).
+    """
+    return build_pattern_groups(M_mask)
+
+
+def factor_E_step_fast(
+    Y: torch.Tensor,
+    M_mask: torch.Tensor,
+    L: torch.Tensor,
+    psi: torch.Tensor,
+    s: torch.Tensor,
+    a2: torch.Tensor,
+    *,
+    pattern_groups: list[PatternGroup] | None = None,
+):
+    """
+    Fast E-step using Woodbury + pattern caching.
+    """
+    return factor_E_step_woodbury(Y, M_mask, L, psi, s, a2, pattern_groups=pattern_groups)
+
+
+def factor_log_likelihood_fast(
+    Y: torch.Tensor,
+    M_mask: torch.Tensor,
+    L: torch.Tensor,
+    psi: torch.Tensor,
+    s: torch.Tensor,
+    a2: torch.Tensor,
+    *,
+    pattern_groups: list[PatternGroup] | None = None,
+):
+    """
+    Fast log-likelihood using Woodbury + pattern caching.
+    """
+    return factor_log_likelihood_woodbury(Y, M_mask, L, psi, s, a2, pattern_groups=pattern_groups)
 

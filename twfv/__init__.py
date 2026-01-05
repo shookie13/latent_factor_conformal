@@ -28,6 +28,7 @@ from .cp import (
     kernel_sampler,
     unflatten,
 )
+from .woodbury import PatternGroup, build_pattern_groups, factor_E_step_woodbury, factor_log_likelihood_woodbury
 
 __all__ = [
     "bspline_basis",
@@ -37,6 +38,10 @@ __all__ = [
     "build_a2_from_C_and_warp",
     "factor_E_step",
     "factor_log_likelihood",
+    "PatternGroup",
+    "build_pattern_groups",
+    "factor_E_step_woodbury",
+    "factor_log_likelihood_woodbury",
     "run_em_like",
     "simulate_factor_data_bspline",
     "make_open_uniform_knots_np",
