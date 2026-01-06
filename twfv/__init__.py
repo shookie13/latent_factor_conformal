@@ -28,7 +28,7 @@ from .cp import (
     kernel_sampler,
     unflatten,
 )
-from .woodbury import PatternGroup, build_pattern_groups, factor_E_step_woodbury, factor_log_likelihood_woodbury
+from .woodbury import PatternGroup, build_pattern_groups, factor_E_step_woodbury, factor_log_likelihood_woodbury, factor_log_likelihood_woodbury_minibatch
 from .metrics import binned_interval_stats_by_quantiles, conditional_interval_report
 from .plot import plot_intervals_on_series_from_q_sigma
 from .plot import plot_compare_conditional_reports
@@ -44,6 +44,7 @@ __all__ = [
     "build_pattern_groups",
     "factor_E_step_woodbury",
     "factor_log_likelihood_woodbury",
+    "factor_log_likelihood_woodbury_minibatch",
     "binned_interval_stats_by_quantiles",
     "conditional_interval_report",
     "plot_intervals_on_series_from_q_sigma",

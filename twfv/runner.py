@@ -11,6 +11,7 @@ from .factor import (
     factor_log_likelihood,
     factor_log_likelihood_fast,
 )
+from .woodbury import factor_log_likelihood_woodbury_minibatch
 
 
 def run_em_like(
@@ -25,6 +26,8 @@ def run_em_like(
     device=None,
     use_woodbury: bool = True,
     return_history: bool = True,
+    minibatch_size: int | None = None,   # NEW
+    minibatch_seed: int | None = None,   # NEW (optional)
 ):
     """
     Minimal EM-like loop following the provided specification.
@@ -48,7 +51,14 @@ def run_em_like(
     I, T, J = Y.shape
     knots = make_open_uniform_knots(M_ctrl, degree, device=device)
     pattern_groups = build_mask_pattern_groups(M_mask) if use_woodbury else None
-
+    # NEW: list of valid flattened (i,t) rows (those with >=1 observed channel)
+    if use_woodbury:
+        valid_flat = torch.cat([g.flat for g in pattern_groups], dim=0)  # (N_valid,)
+        N_valid = int(valid_flat.numel())
+        gen = None
+        if minibatch_seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(minibatch_seed)
     # Parameters
     L = nn.Parameter(torch.randn(J, r, device=device) * 0.1)
     psi_raw = nn.Parameter(torch.zeros(J, device=device))
@@ -115,7 +125,18 @@ def run_em_like(
     psi = torch.nn.functional.softplus(psi_raw) + 1e-4
     s = torch.nn.functional.softplus(s_raw) + 1e-4
     _, a2 = build_a2_from_C_and_warp(C, knots, degree, u_tilde)
-    if use_woodbury:
+    if use_woodbury and (minibatch_size is not None) and (minibatch_size < N_valid):
+        # NEW: sample WITHOUT replacement from valid_flat
+        perm = torch.randperm(N_valid, device=device, generator=gen)[:minibatch_size]
+        flat_batch = valid_flat.index_select(0, perm)
+
+        ll = factor_log_likelihood_woodbury_minibatch(
+            Y, M_mask, L, psi, s, a2,
+            pattern_groups=pattern_groups,
+            flat_batch=flat_batch,
+            total_n=N_valid,
+        )
+    elif use_woodbury:
         F_tilde, _ = factor_E_step_fast(Y, M_mask, L, psi, s, a2, pattern_groups=pattern_groups)
     else:
         F_tilde, _ = factor_E_step(Y, M_mask, L, psi, s, a2)

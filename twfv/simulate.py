@@ -229,6 +229,20 @@ def simulate_factor_data_bspline(
     u_tilde = build_time_warp_from_proxy_np(vol_proxy, eps=eps_warp)  # (I,T,r)
 
     # Build log-variance via B-spline at warped times
+    # 
+    # For each subject i = 0,...,I-1
+    # For each factor k = 0,...,r-1:
+    #   - Let ũ_{i,:,k} ∈ ℝ^T be the vector of warped times for subject i, factor k.
+    #   - Let {b_m(·)}_{m=1}^{M_ctrl} be the set of B-spline basis functions of given degree and knots.
+    #   - Let C_true[i, k, :] ∈ ℝ^{M_ctrl} be the control points for subject i, factor k.
+    #
+    #   The log-variance (at time t) is parameterized as:
+    #       s_{i,t,k} = sum_{m=1}^{M_ctrl} b_m(ũ_{i,t,k}) * C_true[i, k, m]
+    #               = B @ C_true[i, k, :]
+    #   This gives:
+    #       log_a2[i, t, k] = s_{i, t, k}
+    #       a2_true[i, t, k] = exp(s_{i, t, k})
+    #
     log_a2 = np.zeros((I, T, r), dtype=float)
     a2_true = np.zeros_like(log_a2)
     for i in range(I):

@@ -245,4 +245,92 @@ def factor_log_likelihood_woodbury(
     )
     return ll
 
+def factor_log_likelihood_woodbury_minibatch(
+    Y: torch.Tensor,
+    M_mask: torch.Tensor,
+    L: torch.Tensor,
+    psi: torch.Tensor,
+    s: torch.Tensor,
+    a2: torch.Tensor,
+    *,
+    pattern_groups: List[PatternGroup],
+    flat_batch: torch.Tensor,         # (B,) flattened indices into i*T+t
+    total_n: int,                     # total number of valid (i,t) rows (with >=1 obs)
+    eps: float = 1e-12,
+    jitter: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Minibatch log-likelihood using the same Woodbury+pattern code, but only on flat_batch.
+    Returns an unbiased estimate of the FULL sum log-likelihood by scaling total_n / batch_n.
+    """
+    I, T, J = Y.shape
+    r = L.shape[1]
+    device = Y.device
+    dtype = Y.dtype
+
+    # flatten once
+    Y_flat = Y.reshape(I * T, J)
+    a2_flat = a2.reshape(I * T, r)
+
+    # mark which rows are in the batch
+    batch_flag = torch.zeros((I * T,), dtype=torch.bool, device=device)
+    batch_flag[flat_batch] = True
+
+    ll = torch.zeros((), dtype=dtype, device=device)
+    eye_r = torch.eye(r, dtype=dtype, device=device)
+
+    for g in pattern_groups:
+        # select only rows of this pattern that are in the minibatch
+        sel = batch_flag.index_select(0, g.flat)          # (n_g,)
+        if not torch.any(sel):
+            continue
+
+        flat = g.flat[sel]
+        i_idx = g.i_idx[sel]
+        idx = g.idx
+        Jo = g.J_obs
+        n = flat.numel()
+
+        # same math as factor_E_step_woodbury (but NO F_tilde writing)
+        Y_blk = Y_flat.index_select(0, flat).index_select(1, idx)  # (n, Jo)
+
+        psi_idx = psi.index_select(0, idx)                       # (Jo,)
+        d_sqrt_inv = torch.rsqrt(psi_idx + eps)                  # D^{-1/2}
+        logdet_D = torch.log(psi_idx + eps).sum()                # log|D|
+
+        L_idx = L.index_select(0, idx)                           # (Jo, r)
+        W = d_sqrt_inv.unsqueeze(1) * L_idx                      # (Jo, r)
+        G = W.T @ W                                              # (r, r)
+
+        Z = Y_blk * d_sqrt_inv.unsqueeze(0)                      # (n, Jo)
+        V = Z @ W                                                # (n, r)
+        z2 = (Z * Z).sum(dim=1)                                  # (n,)
+
+        A_rows = a2_flat.index_select(0, flat)                   # (n, r)
+        s2 = (s.index_select(0, i_idx) ** 2)                     # (n,)
+
+        invA = 1.0 / (A_rows + eps)                              # (n, r)
+        invs2 = 1.0 / (s2 + eps)                                 # (n,)
+
+        S = torch.diag_embed(invA) + invs2.view(n, 1, 1) * G      # (n, r, r)
+        if jitter > 0:
+            S = S + jitter * eye_r
+
+        Lch = torch.linalg.cholesky(S)                            # (n, r, r)
+        logdet_S = 2.0 * torch.log(torch.diagonal(Lch, dim1=-2, dim2=-1)).sum(dim=1)
+
+        w = torch.cholesky_solve(V.unsqueeze(-1), Lch).squeeze(-1) # (n, r)
+        v_dot_w = (V * w).sum(dim=1)                               # (n,)
+
+        yHy = invs2 * z2 - (invs2 * invs2) * v_dot_w               # (n,)
+
+        logdet_A = torch.log(A_rows + eps).sum(dim=1)              # (n,)
+        logdet_H = logdet_A + (Jo * torch.log(s2 + eps)) + logdet_D + logdet_S
+
+        ll = ll + (-0.5) * (logdet_H + yHy).sum()
+
+    # scale minibatch sum to estimate full-data sum (unbiased gradient)
+    batch_n = flat_batch.numel()
+    ll = ll * (float(total_n) / float(batch_n))
+    return ll
 
