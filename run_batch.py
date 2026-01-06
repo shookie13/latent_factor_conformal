@@ -8,7 +8,9 @@ from twfv.simulate import simulate_factor_data_bspline
 from twfv.cp import unflatten
 from twfv.bspline import make_open_uniform_knots
 from twfv.variance import build_a2_from_C_and_warp
-
+# Save CSV (append if exists)
+import csv
+import os
 
 def flatten(i: int, j: int, t: int, I: int, J: int, T: int) -> int:
     return i * (J * T) + j * T + t
@@ -164,7 +166,7 @@ def run_one(main_seed: int, *, I: int, T: int, J: int, r: int, M_ctrl: int, degr
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--main-seeds", type=int, nargs="+", default=list(range(10)))
+    p.add_argument("--main-seeds", type=int, nargs="+", default=list(range(20,50)))
     p.add_argument("--I", type=int, default=10)
     p.add_argument("--T", type=int, default=100)
     p.add_argument("--J", type=int, default=5)
@@ -198,12 +200,16 @@ def main():
         results.append(res)
         print(f"main_seed={ms} coverage={res['coverage']:.3f} q={res['q']:.3f} n_test={res['n_test']}")
 
-    # Save CSV
-    import csv
 
-    with open(args.out_csv, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-        w.writeheader()
+    fieldnames = list(results[0].keys())
+    file_exists = os.path.exists(args.out_csv)
+    needs_header = (not file_exists) or (os.path.getsize(args.out_csv) == 0)
+    mode = "a" if file_exists else "w"
+
+    with open(args.out_csv, mode, newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if needs_header:
+            w.writeheader()
         w.writerows(results)
 
     covs = np.array([r["coverage"] for r in results], dtype=float)

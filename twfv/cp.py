@@ -55,7 +55,9 @@ def _quantile_higher(scores: np.ndarray, alpha: float) -> float:
 
 class NaiveAbsoluteResidualCP:
     """
-    Per-channel split conformal using absolute residuals; expects external fitted means.
+    Global split conformal using absolute residuals; expects external fitted means.
+
+    Calibrates a single scalar q (across all i,t,j in the calibration set).
     """
 
     def __init__(self, shape_ref: np.ndarray, J: int, alpha: float = 0.1):
@@ -69,7 +71,7 @@ class NaiveAbsoluteResidualCP:
         self.alpha = alpha
         self.I = shape_ref.shape[0]
         self.T = shape_ref.shape[1]
-        self.q_abs = np.full(J, np.nan, dtype=float)
+        self.q_abs = float("nan")
 
     def fit(self, X_obs_idx: np.ndarray, Y_obs: np.ndarray) -> None:
         raise NotImplementedError("No internal model. Use calibrate_from_fit().")
@@ -81,23 +83,18 @@ class NaiveAbsoluteResidualCP:
         raise NotImplementedError("Use predict_interval_from_fit(fit).")
 
     def calibrate_from_fit(self, X_cal_idx: np.ndarray, Y_cal_true: np.ndarray, Y_cal_fit: np.ndarray) -> None:
-        per_stream = [[] for _ in range(self.J)]
-        for k, y_true, y_fit in zip(X_cal_idx.tolist(), Y_cal_true.tolist(), Y_cal_fit.tolist()):
-            _, j, _ = unflatten(int(k), self.I, self.J, self.T)
-            per_stream[j].append(abs(y_true - y_fit))
-        for j in range(self.J):
-            res = np.array(per_stream[j], dtype=float)
-            self.q_abs[j] = _quantile_higher(res, self.alpha) if res.size > 0 else np.nan
+        # Note: X_cal_idx is accepted for API consistency, but not used here.
+        res = np.abs(np.asarray(Y_cal_true, dtype=float) - np.asarray(Y_cal_fit, dtype=float))
+        self.q_abs = _quantile_higher(res, self.alpha) if res.size > 0 else float("nan")
 
     def predict_interval_from_fit(self, X_test_idx: np.ndarray, Y_test_fit: np.ndarray, alpha: float) -> np.ndarray:
         out = np.zeros((X_test_idx.size, 2), dtype=float)
-        for idx, (k, y_fit) in enumerate(zip(X_test_idx.tolist(), Y_test_fit.tolist())):
-            _, j, _ = unflatten(int(k), self.I, self.J, self.T)
-            q = self.q_abs[j]
-            if not np.isfinite(q):
-                q = 0.0
-            out[idx, 0] = y_fit - q
-            out[idx, 1] = y_fit + q
+        q = self.q_abs
+        if not np.isfinite(q):
+            q = 0.0
+        y_fit = np.asarray(Y_test_fit, dtype=float)
+        out[:, 0] = y_fit - q
+        out[:, 1] = y_fit + q
         return out
 
 
