@@ -231,6 +231,7 @@ def simulate_factor_data_bspline(
     # Build log-variance via B-spline at warped times
     log_a2 = np.zeros((I, T, r), dtype=float)
     a2_true = np.zeros_like(log_a2)
+    s_t_true = np.zeros((I, T, r), dtype=float)
     for i in range(I):
         for k in range(r):
             B = bspline_basis_np(u_tilde[i, :, k], knots, degree)  # (T, M_ctrl)
@@ -238,7 +239,7 @@ def simulate_factor_data_bspline(
             s_t = s_t.ravel()
             log_a2[i, :, k] = s_t
             a2_true[i, :, k] = np.exp(s_t)
-
+            s_t_true[i, :, k] = s_t
     # Normalize per subject to mean 1 to avoid scale drift
     means = np.clip(a2_true.mean(axis=1, keepdims=True), 1e-6, None)
     a2_true = a2_true / means
@@ -252,7 +253,7 @@ def simulate_factor_data_bspline(
         for t_idx in range(T):
             # var_f = kappa_true[i] * a2_true[i, t_idx, :]
             #   where var_f[k] = \kappa_i * a^2_{i, t, k}
-            var_f = kappa_true[i] * a2_true[i, t_idx, :]  # (r,) elementwise
+            var_f = kappa_true[i] * a2_true[i, t_idx, :]**2  # (r,) elementwise
 
             # F_it ~ N(0, diag(var_f)), so F_it[k] ~ N(0, var_f[k]) for k = 0,...,r-1
             F_it = rng.normal(loc=0.0, scale=np.sqrt(var_f), size=r)  # (r,)
@@ -279,8 +280,10 @@ def simulate_factor_data_bspline(
         s_true=s_true,
         kappa_true=kappa_true,
         C_true=C_true,
+        s_t_true=s_t_true,
         a2_true=a2_true,
         log_a2_true=log_a2,
+        a2_true_means = means,
         u_tilde_true=u_tilde,
         vol_proxy=vol_proxy,
         knots=knots,

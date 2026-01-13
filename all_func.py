@@ -1,6 +1,7 @@
-import torch
-
 from __future__ import annotations
+
+import torch
+from torch import nn
 
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -512,7 +513,10 @@ def run_em_like(
             # Optional centering: keep mean log variance near zero per (i, k).
             with torch.no_grad():
                 mean_log = log_a2.mean(dim=1, keepdim=True)  # (I,1,r)
-                C.data[:, :, 0] -= mean_log.squeeze(1)
+                # Shift the *entire* spline curve by subtracting a constant from all control points.
+                # B-spline bases form a partition of unity, so adding the same constant to every
+                # control point shifts log_a2(t) by that constant for all t (up to numerical error).
+                C.data -= mean_log.squeeze(1).unsqueeze(-1)
 
         with torch.no_grad():
             psi = torch.nn.functional.softplus(psi_raw) + 1e-4

@@ -25,6 +25,9 @@ def run_em_like(
     device=None,
     use_woodbury: bool = True,
     return_history: bool = True,
+    warp_eta: float = 1.0,
+    collect_diagnostics: bool = False,
+    diagnostics_t_head: int = 8,
 ):
     """
     Minimal EM-like loop following the provided specification.
@@ -61,6 +64,21 @@ def run_em_like(
     optim = torch.optim.Adam([L, psi_raw, s_raw, C], lr=lr)
 
     history: dict[str, list[float]] = {"ll_outer": [], "ll_post_m": []}
+    if collect_diagnostics:
+        # Control point C[:,:,0] drift stats
+        history.update(
+            {
+                "C0_mean": [],
+                "C0_std": [],
+                "C0_max_abs": [],
+                # Early-time warp / variance summaries (averaged over subjects and factors)
+                "u_head_mean": [],          # length diagnostics_t_head (flattened into list)
+                "u_head_inc_mean": [],      # length diagnostics_t_head-1
+                "u_head_inc_min": [],       # scalar
+                "a2_head_mean": [],         # length diagnostics_t_head
+                "a2_head_max": [],          # length diagnostics_t_head
+            }
+        )
     prev_ll = None
     for _ in range(max_outer):
         with torch.no_grad():
@@ -73,8 +91,44 @@ def run_em_like(
                 )
             else:
                 F_tilde, ll_val = factor_E_step(Y, M_mask, L, psi, s, a2)
-            u_tilde = update_time_warp(F_tilde)
+            u_new = update_time_warp(F_tilde)
+            eta = float(warp_eta)
+            if eta <= 0.0:
+                # freeze warp
+                pass
+            elif eta >= 1.0:
+                u_tilde = u_new
+            else:
+                # Damp warp updates for stability; preserves monotonicity and endpoints.
+                u_tilde = (1.0 - eta) * u_tilde + eta * u_new
             history["ll_outer"].append(float(ll_val.detach().cpu().item()))
+
+            if collect_diagnostics:
+                # Keep this extremely cheap: summaries only.
+                c0 = C[:, :, 0]  # (I, r)
+                history["C0_mean"].append(float(c0.mean().detach().cpu().item()))
+                history["C0_std"].append(float(c0.std(unbiased=False).detach().cpu().item()))
+                history["C0_max_abs"].append(float(c0.abs().max().detach().cpu().item()))
+
+                t_head = int(min(max(diagnostics_t_head, 1), T))
+                # Warp summaries
+                u_head = u_tilde[:, :t_head, :].mean(dim=(0, 2))  # (t_head,)
+                if t_head >= 2:
+                    du = (u_tilde[:, 1:t_head, :] - u_tilde[:, : t_head - 1, :]).mean(dim=(0, 2))  # (t_head-1,)
+                    du_min = (u_tilde[:, 1:t_head, :] - u_tilde[:, : t_head - 1, :]).min().item()
+                else:
+                    du = torch.empty((0,), device=u_tilde.device)
+                    du_min = float("nan")
+                history["u_head_mean"].append(u_head.detach().cpu().tolist())
+                history["u_head_inc_mean"].append(du.detach().cpu().tolist())
+                history["u_head_inc_min"].append(float(du_min))
+
+                # Variance summaries at early times: average and max over (i,k)
+                a2_head = a2[:, :t_head, :]  # (I, t_head, r)
+                a2_mean = a2_head.mean(dim=(0, 2))  # (t_head,)
+                a2_max = a2_head.amax(dim=(0, 2))   # (t_head,)
+                history["a2_head_mean"].append(a2_mean.detach().cpu().tolist())
+                history["a2_head_max"].append(a2_max.detach().cpu().tolist())
 
         for _ in range(grad_steps):
             psi = torch.nn.functional.softplus(psi_raw) + 1e-4
@@ -94,7 +148,10 @@ def run_em_like(
             # Optional centering: keep mean log variance near zero per (i, k).
             with torch.no_grad():
                 mean_log = log_a2.mean(dim=1, keepdim=True)  # (I,1,r)
-                C.data[:, :, 0] -= mean_log.squeeze(1)
+                # Shift the *entire* spline curve by subtracting a constant from all control points.
+                # B-spline bases form a partition of unity, so adding the same constant to every
+                # control point shifts log_a2(t) by that constant for all t (up to numerical error).
+                C.data -= mean_log.squeeze(1).unsqueeze(-1)
 
         with torch.no_grad():
             psi = torch.nn.functional.softplus(psi_raw) + 1e-4

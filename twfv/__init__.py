@@ -32,6 +32,7 @@ from .woodbury import PatternGroup, build_pattern_groups, factor_E_step_woodbury
 from .metrics import binned_interval_stats_by_quantiles, conditional_interval_report
 from .plot import plot_intervals_on_series_from_q_sigma
 from .plot import plot_compare_conditional_reports
+from .diagnostics import cal_test_scaled_residual_diagnostics
 __all__ = [
     "bspline_basis",
     "make_open_uniform_knots",
@@ -65,5 +66,6 @@ __all__ = [
     "kernel",
     "kernel_sampler",
     "unflatten",
+    "cal_test_scaled_residual_diagnostics",
 ]
 

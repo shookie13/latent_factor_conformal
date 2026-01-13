@@ -1,5 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import re
+import matplotlib.colors as mcolors
 from .cp import unflatten
 
 def plot_intervals_on_series_from_q_sigma(
@@ -164,6 +167,24 @@ def plot_compare_conditional_reports(
     keys: tuple[str, ...] = ("X", "Y", "abs_resid"),
     title: str | None = None,
     alpha_target: float | None = None,
+    # Optional: if provided, add two extra graphs:
+    #  (a) coverage by channel j over all (i,t) points
+    #  (b) histogram of per-subject coverage over (t,j)
+    channel_ids: np.ndarray | None = None,     # (n_points,) int in [0, J-1]
+    subject_ids: np.ndarray | None = None,     # (n_points,) int in [0, I-1]
+    covered_a: np.ndarray | None = None,       # (n_points,) bool
+    covered_b: np.ndarray | None = None,       # (n_points,) bool
+    show_point_values: bool = True,
+    save_plots: bool = False,
+    save_dir: str = "result_img",
+    save_basename: str | None = None,
+    show: bool = True,
+    dpi: int = 200,
+    annotation_fontsize: int = 10,
+    show_heatmap_subject_channel: bool = True,
+    heatmap_style: str = "imshow",  # "imshow" | "contourf"
+    heatmap_levels: int = 15,
+    heatmap_upsample: int = 1,
 ):
     """
     Compare two conditional interval reports produced by twfv.metrics.conditional_interval_report.
@@ -172,6 +193,15 @@ def plot_compare_conditional_reports(
     where each row has fields: bin, left, right, n, coverage, avg_length.
 
     Produces a grid of plots: one row per key, two columns (coverage, avg interval length).
+
+    If channel_ids/subject_ids and covered_* are provided, also produces:
+      1) coverage by channel j (aggregated over all provided points)
+      2) histogram of per-subject coverage (aggregated over all provided points)
+      3) coverage by (subject, channel) as either a heatmap ("imshow") or filled contour ("contourf").
+
+    Notes on smoothing:
+      - For `heatmap_style="contourf"`, the matrix is upsampled using `scipy.ndimage.zoom`
+        with cubic interpolation to make contours smoother.
     """
     # Filter keys to those available in both reports
     keys_use = [k for k in keys if (k in report_a and k in report_b)]
@@ -179,7 +209,7 @@ def plot_compare_conditional_reports(
         raise ValueError("No overlapping keys found in both reports.")
 
     nrows = len(keys_use)
-    fig, axes = plt.subplots(nrows=nrows, ncols=2, figsize=(12, 3.2 * nrows), squeeze=False)
+    fig, axes = plt.subplots(nrows=nrows, ncols=2, figsize=(12, 5 * nrows), squeeze=False)
 
     for row_i, k in enumerate(keys_use):
         rows_a = report_a[k]["rows"]
@@ -199,8 +229,10 @@ def plot_compare_conditional_reports(
         ax_cov = axes[row_i, 0]
         ax_len = axes[row_i, 1]
 
-        ax_cov.plot(centers, cov_a, marker="o", label=f"{label_a}")
-        ax_cov.plot(centers, cov_b, marker="o", label=f"{label_b}")
+        line_a_cov, = ax_cov.plot(centers, cov_a, marker="o", label=f"{label_a}")
+        line_b_cov, = ax_cov.plot(centers, cov_b, marker="o", label=f"{label_b}")
+        color_a_cov = line_a_cov.get_color()
+        color_b_cov = line_b_cov.get_color()
         if alpha_target is not None:
             ax_cov.axhline(1.0 - float(alpha_target), color="black", linestyle="--", linewidth=1, alpha=0.6, label="target")
         ax_cov.set_title(f"{k}: coverage by quantile bins")
@@ -210,23 +242,317 @@ def plot_compare_conditional_reports(
         ax_cov.grid(True, alpha=0.25)
         ax_cov.legend(loc="best")
 
-        ax_len.plot(centers, len_a, marker="o", label=f"{label_a}")
-        ax_len.plot(centers, len_b, marker="o", label=f"{label_b}")
+        line_a_len, = ax_len.plot(centers, len_a, marker="o", label=f"{label_a}")
+        line_b_len, = ax_len.plot(centers, len_b, marker="o", label=f"{label_b}")
+        color_a_len = line_a_len.get_color()
+        color_b_len = line_b_len.get_color()
         ax_len.set_title(f"{k}: avg interval length by quantile bins")
         ax_len.set_xlabel(f"{k} (bin centers)")
         ax_len.set_ylabel("avg length")
         ax_len.grid(True, alpha=0.25)
         ax_len.legend(loc="best")
 
+        if show_point_values:
+            for i in range(nb):
+                if np.isfinite(centers[i]) and np.isfinite(cov_a[i]):
+                    ax_cov.annotate(
+                        f"{cov_a[i]:.2f}",
+                        (centers[i], cov_a[i]),
+                        textcoords="offset points",
+                        xytext=(-5, -12),
+                        ha="right",
+                        fontsize=annotation_fontsize,
+                        alpha=0.85,
+                        color=color_a_cov,
+                    )
+                if np.isfinite(centers[i]) and np.isfinite(cov_b[i]):
+                    ax_cov.annotate(
+                        f"{cov_b[i]:.2f}",
+                        (centers[i], cov_b[i]),
+                        textcoords="offset points",
+                        xytext=(5, -12),
+                        ha="left",
+                        fontsize=annotation_fontsize,
+                        alpha=0.85,
+                        color=color_b_cov,
+                    )
+                if np.isfinite(centers[i]) and np.isfinite(len_a[i]):
+                    ax_len.annotate(
+                        f"{len_a[i]:.2f}",
+                        (centers[i], len_a[i]),
+                        textcoords="offset points",
+                        xytext=(-5, -12),
+                        ha="right",
+                        fontsize=annotation_fontsize,
+                        alpha=0.85,
+                        color=color_a_len,
+                    )
+                if np.isfinite(centers[i]) and np.isfinite(len_b[i]):
+                    ax_len.annotate(
+                        f"{len_b[i]:.2f}",
+                        (centers[i], len_b[i]),
+                        textcoords="offset points",
+                        xytext=(5, -12),
+                        ha="left",
+                        fontsize=annotation_fontsize,
+                        alpha=0.85,
+                        color=color_b_len,
+                    )
+
         # Annotate effective sample sizes lightly (use min of the two for compactness)
         for i in range(nb):
             if np.isfinite(centers[i]):
                 ax_cov.annotate(f"n={int(min(n_a[i], n_b[i]))}", (centers[i], cov_a[i] if np.isfinite(cov_a[i]) else 0.0),
-                                textcoords="offset points", xytext=(0, 6), ha="center", fontsize=8, alpha=0.6)
+                                textcoords="offset points", xytext=(0, 6), ha="center", fontsize=annotation_fontsize, alpha=0.6)
 
     if title is not None:
         fig.suptitle(title)
-        plt.tight_layout(rect=(0, 0, 1, 0.97))
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
     else:
-        plt.tight_layout()
-    plt.show()
+        fig.tight_layout()
+
+    def _sanitize(s: str) -> str:
+        s = re.sub(r"[^A-Za-z0-9._-]+", "_", s.strip())
+        return s[:120] if len(s) > 120 else s
+
+    base = save_basename or (title if title is not None else f"{label_a}_vs_{label_b}")
+    base = _sanitize(base)
+
+    if save_plots:
+        os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(os.path.join(save_dir, f"{base}_bins.png"), dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    # --- Extra graphs: coverage by channel and coverage distribution by subject ---
+    if channel_ids is None or subject_ids is None or covered_a is None or covered_b is None:
+        return
+
+    ch = np.asarray(channel_ids)
+    sb = np.asarray(subject_ids)
+    ca = np.asarray(covered_a).astype(bool)
+    cb = np.asarray(covered_b).astype(bool)
+
+    if not (ch.ndim == sb.ndim == ca.ndim == cb.ndim == 1):
+        raise ValueError("channel_ids, subject_ids, covered_a, covered_b must be 1D arrays")
+    if not (ch.size == sb.size == ca.size == cb.size):
+        raise ValueError("channel_ids/subject_ids/covered_a/covered_b must have the same length")
+
+    # coverage by channel
+    J_max = int(np.max(ch)) + 1 if ch.size > 0 else 0
+    cov_by_ch_a = np.full(J_max, np.nan, dtype=float)
+    cov_by_ch_b = np.full(J_max, np.nan, dtype=float)
+    n_by_ch = np.zeros(J_max, dtype=int)
+    for j in range(J_max):
+        m = ch == j
+        n_by_ch[j] = int(np.sum(m))
+        if n_by_ch[j] > 0:
+            cov_by_ch_a[j] = float(np.mean(ca[m]))
+            cov_by_ch_b[j] = float(np.mean(cb[m]))
+
+    # per-subject coverage distribution
+    I_max = int(np.max(sb)) + 1 if sb.size > 0 else 0
+    cov_by_sb_a = np.full(I_max, np.nan, dtype=float)
+    cov_by_sb_b = np.full(I_max, np.nan, dtype=float)
+    n_by_sb = np.zeros(I_max, dtype=int)
+    for i in range(I_max):
+        m = sb == i
+        n_by_sb[i] = int(np.sum(m))
+        if n_by_sb[i] > 0:
+            cov_by_sb_a[i] = float(np.mean(ca[m]))
+            cov_by_sb_b[i] = float(np.mean(cb[m]))
+
+    fig2, axes2 = plt.subplots(nrows=1, ncols=2, figsize=(12, 5))
+
+    ax_ch = axes2[0]
+    xs = np.arange(J_max)
+    line_a_ch, = ax_ch.plot(xs, cov_by_ch_a, marker="o", label=label_a)
+    line_b_ch, = ax_ch.plot(xs, cov_by_ch_b, marker="o", label=label_b)
+    color_a_ch = line_a_ch.get_color()
+    color_b_ch = line_b_ch.get_color()
+    if alpha_target is not None:
+        ax_ch.axhline(1.0 - float(alpha_target), color="black", linestyle="--", linewidth=1, alpha=0.6, label="target")
+    ax_ch.set_xlabel("channel j")
+    ax_ch.set_ylabel("coverage (over provided points)")
+    ax_ch.set_ylim(0.0, 1.0)
+    ax_ch.set_title("Coverage by channel")
+    ax_ch.grid(True, alpha=0.25)
+    ax_ch.legend(loc="best")
+    for j in range(J_max):
+        if n_by_ch[j] > 0 and np.isfinite(cov_by_ch_a[j]):
+            ax_ch.annotate(f"n={n_by_ch[j]}", (j, cov_by_ch_a[j]), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=8, alpha=0.6)
+            if show_point_values:
+                ax_ch.annotate(
+                    f"{cov_by_ch_a[j]:.2f}",
+                    (j, cov_by_ch_a[j]),
+                    textcoords="offset points",
+                    xytext=(-5, -12),
+                    ha="right",
+                    fontsize=annotation_fontsize,
+                    alpha=0.85,
+                    color=color_a_ch,
+                )
+        if show_point_values and n_by_ch[j] > 0 and np.isfinite(cov_by_ch_b[j]):
+            ax_ch.annotate(
+                f"{cov_by_ch_b[j]:.2f}",
+                (j, cov_by_ch_b[j]),
+                textcoords="offset points",
+                xytext=(5, -12),
+                ha="left",
+                fontsize=annotation_fontsize,
+                alpha=0.85,
+                color=color_b_ch,
+            )
+
+    ax_sb = axes2[1]
+    a_vals = cov_by_sb_a[np.isfinite(cov_by_sb_a)]
+    b_vals = cov_by_sb_b[np.isfinite(cov_by_sb_b)]
+    bins = np.linspace(0.5, 1.0, 21)
+    ax_sb.hist(a_vals, bins=bins, alpha=0.5, label=label_a)
+    ax_sb.hist(b_vals, bins=bins, alpha=0.5, label=label_b)
+    if alpha_target is not None:
+        ax_sb.axvline(1.0 - float(alpha_target), color="black", linestyle="--", linewidth=1, alpha=0.6, label="target")
+    ax_sb.set_xlabel("per-subject coverage")
+    ax_sb.set_ylabel("count of subjects")
+    ax_sb.set_title("Distribution of per-subject coverage")
+    ax_sb.grid(True, alpha=0.25)
+    ax_sb.legend(loc="best")
+
+    if title is not None:
+        fig2.suptitle(title + " (channel/subject diagnostics)")
+        fig2.tight_layout(rect=(0, 0, 1, 0.95))
+    else:
+        fig2.tight_layout()
+
+    if save_plots:
+        os.makedirs(save_dir, exist_ok=True)
+        fig2.savefig(os.path.join(save_dir, f"{base}_channel_subject.png"), dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig2)
+
+    # --- Extra heatmap: coverage by (subject, channel) ---
+    if not show_heatmap_subject_channel:
+        return
+
+    # Compute per (channel, subject) coverage matrices
+    I_max = int(np.max(sb)) + 1 if sb.size > 0 else 0
+    J_max = int(np.max(ch)) + 1 if ch.size > 0 else 0
+
+    cov_mat_a = np.full((J_max, I_max), np.nan, dtype=float)  # rows=channel, cols=subject
+    cov_mat_b = np.full((J_max, I_max), np.nan, dtype=float)
+    count_mat = np.zeros((J_max, I_max), dtype=int)
+
+    for i in range(I_max):
+        mi = sb == i
+        if not np.any(mi):
+            continue
+        for j in range(J_max):
+            m = mi & (ch == j)
+            c = int(np.sum(m))
+            count_mat[j, i] = c
+            if c > 0:
+                cov_mat_a[j, i] = float(np.mean(ca[m]))
+                cov_mat_b[j, i] = float(np.mean(cb[m]))
+
+    target = (1.0 - float(alpha_target)) if alpha_target is not None else 0.9
+    # Choose symmetric bounds around target for a diverging normalization
+    all_vals = np.concatenate([cov_mat_a[np.isfinite(cov_mat_a)], cov_mat_b[np.isfinite(cov_mat_b)]])
+    if all_vals.size == 0:
+        return
+    vmin = float(np.nanmin(all_vals))
+    vmax = float(np.nanmax(all_vals))
+    # Ensure bounds include target and have non-zero range
+    vmin = min(vmin, target)
+    vmax = max(vmax, target)
+    if np.isclose(vmin, vmax):
+        vmin = max(0.0, target - 0.1)
+        vmax = min(1.0, target + 0.1)
+
+    norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=target, vmax=vmax)
+    # Use non-reversed RdBu so *lower* values map to red and *higher* values map to blue.
+    # (The center is controlled by TwoSlopeNorm(vcenter=target).)
+    cmap = plt.get_cmap("RdBu_r")  # white-ish around center, red/blue for deviations
+
+    heatmap_style_use = str(heatmap_style).lower().strip()
+    if heatmap_style_use not in {"imshow", "contourf"}:
+        raise ValueError("heatmap_style must be one of {'imshow','contourf'}")
+    levels = int(heatmap_levels)
+    if levels < 3:
+        raise ValueError("heatmap_levels must be >= 3")
+    up = int(max(1, heatmap_upsample))
+
+    fig3, axes3 = plt.subplots(
+        nrows=2,
+        ncols=1,
+        figsize=(max(10, I_max * 0.35), max(4.5, J_max * 0.6) * 2),
+        constrained_layout=True,
+    )
+    if heatmap_style_use == "imshow":
+        im0 = axes3[0].imshow(cov_mat_a, aspect="auto", origin="lower", cmap=cmap, norm=norm)
+        im1 = axes3[1].imshow(cov_mat_b, aspect="auto", origin="lower", cmap=cmap, norm=norm)
+    else:
+        # Filled contours on an (x=subject, y=channel) grid.
+        # Upsample using scipy.ndimage.zoom (cubic interpolation) to make contours smoother.
+        try:
+            from scipy.ndimage import zoom as _zoom
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "heatmap_style='contourf' requires SciPy. Install it (e.g. `pip install scipy`) "
+                "or use heatmap_style='imshow'."
+            ) from e
+
+        def prep(Z: np.ndarray) -> np.ndarray:
+            Zp = np.asarray(Z, dtype=float)
+            # Fill NaNs with target so interpolation doesn't create holes.
+            Zp = np.where(np.isfinite(Zp), Zp, float(target))
+            if up > 1:
+                # zoom factors: (rows=channel, cols=subject)
+                Zp = _zoom(Zp, zoom=(up, up), order=3, mode="nearest", prefilter=True)
+            return Zp
+
+        Za = prep(cov_mat_a)
+        Zb = prep(cov_mat_b)
+        y = np.linspace(0, J_max - 1, Za.shape[0])
+        x = np.linspace(0, I_max - 1, Za.shape[1])
+        X, Y = np.meshgrid(x, y)
+
+        im0 = axes3[0].contourf(X, Y, Za, levels=levels, cmap=cmap, norm=norm)
+        im1 = axes3[1].contourf(X, Y, Zb, levels=levels, cmap=cmap, norm=norm)
+    axes3[0].set_title(f"{label_a}: coverage by (channel, subject) (target={target:.2f})")
+    axes3[0].set_ylabel("channel")
+    axes3[0].set_xlabel("subject")
+
+    axes3[1].set_title(f"{label_b}: coverage by (channel, subject) (target={target:.2f})")
+    axes3[1].set_ylabel("channel")
+    axes3[1].set_xlabel("subject")
+
+    # Ticks (keep light to avoid clutter)
+    if I_max <= 30:
+        axes3[0].set_xticks(np.arange(I_max))
+        axes3[1].set_xticks(np.arange(I_max))
+    if J_max <= 30:
+        axes3[0].set_yticks(np.arange(J_max))
+        axes3[1].set_yticks(np.arange(J_max))
+
+    # Shared colorbar
+    cbar = fig3.colorbar(im1, ax=axes3.ravel().tolist(), fraction=0.02, pad=0.02)
+    cbar.set_label("coverage")
+
+    if title is not None:
+        fig3.suptitle(title + " (subject×channel heatmaps)")
+
+    if save_plots:
+        os.makedirs(save_dir, exist_ok=True)
+        fig3.savefig(os.path.join(save_dir, f"{base}_heatmap_subject_channel.png"), dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig3)
+        
