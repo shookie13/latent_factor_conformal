@@ -13,6 +13,7 @@ def factor_E_step(
     L: torch.Tensor,
     psi: torch.Tensor,
     s: torch.Tensor,
+    kappa: torch.Tensor | None,
     a2: torch.Tensor,
 ):
     """
@@ -24,6 +25,7 @@ def factor_E_step(
         L: loadings (J, r).
         psi: diag entries of Psi, shape (J,).
         s: subject scales (I,).
+        kappa: subject factor scales (I,), positive. If None, treated as ones.
         a2: factor variances (I, T, r).
 
     Returns:
@@ -39,6 +41,7 @@ def factor_E_step(
     Psi_diag = psi
     for i in range(I):
         Psi_i = torch.diag(Psi_diag * (s[i] ** 2))
+        kap_i = 1.0 if kappa is None else kappa[i]
         for t in range(T):
             obs_idx = _mask_observed(M_mask, i, t)
             if obs_idx.numel() == 0:
@@ -46,7 +49,7 @@ def factor_E_step(
             y_obs = Y[i, t, obs_idx]
             L_obs = L[obs_idx]
             Psi_obs = Psi_i[obs_idx][:, obs_idx]
-            A_it = torch.diag(a2[i, t])
+            A_it = torch.diag(a2[i, t] * kap_i)
 
             H_obs = L_obs @ A_it @ L_obs.T + Psi_obs
             H_inv_y = torch.linalg.solve(H_obs, y_obs)
@@ -65,12 +68,13 @@ def factor_log_likelihood(
     L: torch.Tensor,
     psi: torch.Tensor,
     s: torch.Tensor,
+    kappa: torch.Tensor | None,
     a2: torch.Tensor,
 ):
     """
     Same as factor_E_step but returns only log-likelihood (differentiable).
     """
-    _, ll = factor_E_step(Y, M_mask, L, psi, s, a2)
+    _, ll = factor_E_step(Y, M_mask, L, psi, s, kappa, a2)
     return ll
 
 
@@ -87,6 +91,7 @@ def factor_E_step_fast(
     L: torch.Tensor,
     psi: torch.Tensor,
     s: torch.Tensor,
+    kappa: torch.Tensor | None,
     a2: torch.Tensor,
     *,
     pattern_groups: list[PatternGroup] | None = None,
@@ -94,7 +99,7 @@ def factor_E_step_fast(
     """
     Fast E-step using Woodbury + pattern caching.
     """
-    return factor_E_step_woodbury(Y, M_mask, L, psi, s, a2, pattern_groups=pattern_groups)
+    return factor_E_step_woodbury(Y, M_mask, L, psi, s, kappa, a2, pattern_groups=pattern_groups)
 
 
 def factor_log_likelihood_fast(
@@ -103,6 +108,7 @@ def factor_log_likelihood_fast(
     L: torch.Tensor,
     psi: torch.Tensor,
     s: torch.Tensor,
+    kappa: torch.Tensor | None,
     a2: torch.Tensor,
     *,
     pattern_groups: list[PatternGroup] | None = None,
@@ -110,5 +116,5 @@ def factor_log_likelihood_fast(
     """
     Fast log-likelihood using Woodbury + pattern caching.
     """
-    return factor_log_likelihood_woodbury(Y, M_mask, L, psi, s, a2, pattern_groups=pattern_groups)
+    return factor_log_likelihood_woodbury(Y, M_mask, L, psi, s, kappa, a2, pattern_groups=pattern_groups)
 

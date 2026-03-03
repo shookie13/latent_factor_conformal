@@ -15,10 +15,12 @@ from .simulate import (
     build_time_warp_from_proxy_np,
     missing_prob_from_factor_variance,
     sample_mask_from_varf,
+    split_cal_test_from_train_and_pmiss,
 )
 from .cp import (
     CPMethod,
     NaiveAbsoluteResidualCP,
+    CPTDRSplitConformalCP,
     WeightedSplitConformalCP,
     LocalizedSplitConformalCP,
     LocalizedWeightedSplitConformalCP,
@@ -32,7 +34,7 @@ from .woodbury import PatternGroup, build_pattern_groups, factor_E_step_woodbury
 from .metrics import binned_interval_stats_by_quantiles, conditional_interval_report
 from .plot import plot_intervals_on_series_from_q_sigma
 from .plot import plot_compare_conditional_reports
-from .diagnostics import cal_test_scaled_residual_diagnostics
+from .diagnostics import cal_test_scaled_residual_diagnostics, resample_test_idx_and_collect_scaled_cp_artifacts,plot_em_history_grid
 __all__ = [
     "bspline_basis",
     "make_open_uniform_knots",
@@ -56,8 +58,10 @@ __all__ = [
     "build_time_warp_from_proxy_np",
     "missing_prob_from_factor_variance",
     "sample_mask_from_varf",
+    "split_cal_test_from_train_and_pmiss",
     "CPMethod",
     "NaiveAbsoluteResidualCP",
+    "CPTDRSplitConformalCP",
     "WeightedSplitConformalCP",
     "LocalizedSplitConformalCP",
     "LocalizedWeightedSplitConformalCP",
@@ -67,5 +71,7 @@ __all__ = [
     "kernel_sampler",
     "unflatten",
     "cal_test_scaled_residual_diagnostics",
+    "resample_test_idx_and_collect_scaled_cp_artifacts",
+    "plot_em_history_grid",
 ]
 

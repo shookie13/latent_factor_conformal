@@ -47,15 +47,16 @@ def main():
     L = torch.randn(J, r, dtype=dtype, device=device) * 0.3
     psi = torch.rand(J, dtype=dtype, device=device) * 0.5 + 0.1  # positive
     s = torch.rand(I, dtype=dtype, device=device) * 0.5 + 0.8  # positive
+    kappa = torch.rand(I, dtype=dtype, device=device) * 0.7 + 0.2  # positive
     a2 = torch.rand(I, T, r, dtype=dtype, device=device) * 0.7 + 0.2  # positive
 
     # Dense baseline
-    F_dense, ll_dense = factor_E_step(Y, M_mask, L, psi, s, a2)
+    F_dense, ll_dense = factor_E_step(Y, M_mask, L, psi, s, kappa, a2)
 
     # Fast Woodbury + pattern caching (set jitter=0 for strict equivalence)
     pattern_groups = build_mask_pattern_groups(M_mask)
     F_fast, ll_fast = factor_E_step_woodbury(
-        Y, M_mask, L, psi, s, a2, pattern_groups=pattern_groups, jitter=0.0
+        Y, M_mask, L, psi, s, kappa, a2, pattern_groups=pattern_groups, jitter=0.0
     )
 
     max_abs_F = (F_dense - F_fast).abs().max().item()

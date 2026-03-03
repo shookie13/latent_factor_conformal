@@ -77,6 +77,12 @@ def missing_prob_from_factor_variance(
     """
     Compute per-channel missing probabilities p_miss[j] as a monotone function of the
     factor-induced channel variance v_ch[j] = sum_k X_{j,k}^2 * var_f[k].
+
+    Notes
+    -----
+    This function standardizes *within a single (i,t) row* across channels j when
+    normalize="std" or "minmax". If you want standardization across (i,t) for each
+    channel j, use `missing_prob_from_factor_variance_itj(...)`.
     """
     var_f = np.asarray(var_f, dtype=float)  # (r,)
     X_true = np.asarray(X_true, dtype=float)  # (J, r)
@@ -96,6 +102,69 @@ def missing_prob_from_factor_variance(
         pass
     else:
         raise ValueError(f"Unknown normalize mode: {normalize}")
+    p = 1.0 / (1.0 + np.exp(-(beta0 + beta1 * z)))
+    p = np.clip(p, clip[0], clip[1])
+    return p
+
+
+def missing_prob_from_factor_variance_itj(
+    var_f_it: np.ndarray,
+    X_true: np.ndarray,
+    *,
+    normalize: str = "std",  # "std" | "minmax" | "none"
+    beta0: float = -1.5,
+    beta1: float = 3.0,
+    clip: Tuple[float, float] = (0.15, 0.85),
+    eps: float = 1e-12,
+    standardize_axes: Tuple[int, ...] = (0, 1),
+) -> np.ndarray:
+    """
+    Compute per-point missing probabilities p_miss[i,t,j] from factor variances var_f[i,t,:],
+    with optional standardization performed across specified axes for each fixed channel j.
+
+    Definitions
+    -----------
+    Let X_true be (J,r), var_f_it be (I,T,r), and define channel-induced variance:
+        v_ch[i,t,j] = sum_k X_true[j,k]^2 * var_f_it[i,t,k].
+
+    Then we optionally normalize v_ch over the axes given by `standardize_axes`, separately
+    for each j:
+      - normalize="std":   z = (v_ch - mean(v_ch, axes)) / std(v_ch, axes)
+      - normalize="minmax": z uses min/max over the same axes
+      - normalize="none":  z = v_ch
+
+    Finally:
+        p_miss[i,t,j] = sigmoid(beta0 + beta1 * z[i,t,j]) clipped to `clip`.
+    """
+    var_f_it = np.asarray(var_f_it, dtype=float)
+    if var_f_it.ndim != 3:
+        raise ValueError(f"var_f_it must have shape (I,T,r), got {var_f_it.shape}")
+    X_true = np.asarray(X_true, dtype=float)
+    if X_true.ndim != 2:
+        raise ValueError(f"X_true must have shape (J,r), got {X_true.shape}")
+    I, T, r = var_f_it.shape
+    J, r2 = X_true.shape
+    if r2 != r:
+        raise ValueError(f"X_true second dim {r2} must match var_f_it third dim {r}")
+
+    Xsq = X_true ** 2  # (J,r)
+    # v_ch: (I,T,J)
+    v_ch = np.einsum("itr,jr->itj", var_f_it, Xsq)
+    z = v_ch.copy()
+
+    if normalize == "std":
+        mu = np.mean(z, axis=standardize_axes, keepdims=True)
+        sd = np.std(z, axis=standardize_axes, keepdims=True) + float(eps)
+        z = (z - mu) / sd
+    elif normalize == "minmax":
+        lo = np.min(z, axis=standardize_axes, keepdims=True)
+        hi = np.max(z, axis=standardize_axes, keepdims=True)
+        z = (z - lo) / (hi - lo + float(eps))
+    elif normalize == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown normalize mode: {normalize}")
+
     p = 1.0 / (1.0 + np.exp(-(beta0 + beta1 * z)))
     p = np.clip(p, clip[0], clip[1])
     return p
@@ -129,6 +198,35 @@ def sample_mask_from_varf(
 
     M = np.zeros((I, T, J), dtype=bool)
     P = np.zeros((I, T, J), dtype=float)
+
+    # Option: normalize across (i,t) for each j using the full var_f tensor.
+    # This avoids the "scale cancels out" issue when r=1 and normalize="std"/"minmax".
+    if normalize in ("std_it", "minmax_it", "none_it", "std_t", "minmax_t", "none_t"):
+        if normalize.endswith("_it"):
+            mode = normalize.replace("_it", "")
+            axes = (0, 1)  # standardize across (i,t)
+        elif normalize.endswith("_t"):
+            mode = normalize.replace("_t", "")
+            axes = (1,)  # standardize across time within each i (and per j)
+        else:  # pragma: no cover
+            raise ValueError(f"Unknown normalize mode: {normalize}")
+        var_f_it = (kappa_true[:, None, None] * a2_true)  # (I,T,r)
+        P = missing_prob_from_factor_variance_itj(
+            var_f_it,
+            X_true,
+            normalize=mode,
+            beta0=beta0,
+            beta1=beta1,
+            clip=clip,
+            standardize_axes=axes,
+        )
+        for i in range(I):
+            for t_idx in range(T):
+                draw = rng.uniform(size=J)
+                M[i, t_idx, :] = draw > P[i, t_idx, :]  # True = observed
+        return M, P
+
+    # Default behavior: normalize within each (i,t) across channels.
     for i in range(I):
         for t_idx in range(T):
             var_f = kappa_true[i] * a2_true[i, t_idx, :]
@@ -139,6 +237,72 @@ def sample_mask_from_varf(
             draw = rng.uniform(size=J)
             M[i, t_idx, :] = draw > p_miss  # True = observed
     return M, P
+
+
+def split_cal_test_from_train_and_pmiss(
+    train_idx: np.ndarray,
+    p_miss: np.ndarray,
+    *,
+    seed: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Given a fixed `train_idx` (flatten convention k=i*(J*T)+j*T+t),
+    resample which remaining points are *test* using per-point missing probabilities `p_miss`.
+
+    - `test_idx` is sampled from all points NOT in `train_idx` using Bernoulli(p_miss[k]).
+    - `cal_idx` is the complement: all points not in train and not in test.
+
+    Parameters
+    ----------
+    train_idx:
+        1D integer array of flattened indices (k=i*(J*T)+j*T+t).
+    p_miss:
+        Missing probabilities. Accepts either:
+          - shape (I,T,J) aligned to Y/M in this project, or
+          - flat shape (I*J*T,) aligned to the flatten convention.
+    seed / rng:
+        Randomness control. If `rng` is provided it is used; else `seed` creates a new RNG.
+
+    Returns
+    -------
+    cal_idx, test_idx:
+        1D integer arrays (disjoint), both excluding `train_idx`.
+    """
+    train_idx = np.asarray(train_idx, dtype=int).ravel()
+    if train_idx.size == 0:
+        raise ValueError("train_idx is empty")
+    if rng is None:
+        rng = np.random.default_rng(seed)
+
+    P = np.asarray(p_miss, dtype=float)
+    if P.ndim == 3:
+        # (I,T,J) -> flatten in (I,J,T) order to match k=i*(J*T)+j*T+t
+        I, T, J = P.shape
+        P_flat = np.transpose(P, (0, 2, 1)).reshape(-1)
+        n_total = I * J * T
+    elif P.ndim == 1:
+        P_flat = P.ravel()
+        n_total = int(P_flat.size)
+    else:
+        raise ValueError("p_miss must have shape (I,T,J) or (I*J*T,)")
+
+    if np.any(~np.isfinite(P_flat)):
+        raise ValueError("p_miss contains non-finite values")
+    P_flat = np.clip(P_flat, 0.0, 1.0)
+
+    if np.any(train_idx < 0) or np.any(train_idx >= n_total):
+        raise ValueError(f"train_idx contains values outside [0, {n_total-1}]")
+
+    # Exclude train points, then sample test among the remaining points.
+    in_train = np.zeros(n_total, dtype=bool)
+    in_train[np.unique(train_idx)] = True
+    remaining = np.flatnonzero(~in_train)
+    u = rng.uniform(size=remaining.size)
+    is_test = u < P_flat[remaining]
+    test_idx = remaining[is_test].astype(int)
+    cal_idx = remaining[~is_test].astype(int)
+    return cal_idx, test_idx
 
 
 def simulate_factor_data_bspline(
@@ -248,13 +412,13 @@ def simulate_factor_data_bspline(
     Y = np.zeros((I, T, J), dtype=float)
     M = np.zeros((I, T, J), dtype=bool)
     rng_noise = np.random.default_rng(seed + 123)
-
+    var_fs = np.zeros((I, T, r), dtype=float)
     for i in range(I):
         for t_idx in range(T):
             # var_f = kappa_true[i] * a2_true[i, t_idx, :]
             #   where var_f[k] = \kappa_i * a^2_{i, t, k}
-            var_f = kappa_true[i] * a2_true[i, t_idx, :]**2  # (r,) elementwise
-
+            var_f = kappa_true[i] * a2_true[i, t_idx, :]  # (r,) elementwise
+            var_fs[i, t_idx, :] = var_f
             # F_it ~ N(0, diag(var_f)), so F_it[k] ~ N(0, var_f[k]) for k = 0,...,r-1
             F_it = rng.normal(loc=0.0, scale=np.sqrt(var_f), size=r)  # (r,)
 
@@ -286,6 +450,7 @@ def simulate_factor_data_bspline(
         a2_true_means = means,
         u_tilde_true=u_tilde,
         vol_proxy=vol_proxy,
+        var_fs=var_fs,
         knots=knots,
         degree=degree,
         miss_prob_per_channel=miss_prob_per_channel,

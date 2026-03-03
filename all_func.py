@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-
+import time
+import numpy as np
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Iterable, Any
 
 
 def make_open_uniform_knots(num_ctrl: int, degree: int, device=None) -> torch.Tensor:
@@ -444,6 +445,8 @@ def run_em_like(
     device=None,
     use_woodbury: bool = True,
     return_history: bool = True,
+    warp_eta: float = 1.0,
+    freeze_warp: bool = False,
 ):
     """
     Minimal EM-like loop following the provided specification.
@@ -479,9 +482,22 @@ def run_em_like(
 
     optim = torch.optim.Adam([L, psi_raw, s_raw, C], lr=lr)
 
-    history: dict[str, list[float]] = {"ll_outer": [], "ll_post_m": []}
+    history: dict[str, list[float]] = {
+        "ll_outer": [],
+        "ll_post_m": [],
+        # timing (seconds)
+        "t_outer_total_s": [],
+        "t_estep_s": [],
+        "t_warp_s": [],
+        "t_mstep_s": [],
+        "t_post_s": [],
+        "t_total_s": [],
+    }
+    t_start = time.perf_counter()
     prev_ll = None
     for _ in range(max_outer):
+        t_outer0 = time.perf_counter()
+        t_estep0 = time.perf_counter()
         with torch.no_grad():
             psi = torch.nn.functional.softplus(psi_raw) + 1e-4
             s = torch.nn.functional.softplus(s_raw) + 1e-4
@@ -492,9 +508,22 @@ def run_em_like(
                 )
             else:
                 F_tilde, ll_val = factor_E_step(Y, M_mask, L, psi, s, a2)
-            u_tilde = update_time_warp(F_tilde)
+        t_estep1 = time.perf_counter()
+        t_warp0 = time.perf_counter()
+        with torch.no_grad():
+            u_new = update_time_warp(F_tilde)
+            eta = 0.0 if bool(freeze_warp) else float(warp_eta)
+            if eta <= 0.0:
+                # freeze warp
+                pass
+            elif eta >= 1.0:
+                u_tilde = u_new
+            else:
+                u_tilde = (1.0 - eta) * u_tilde + eta * u_new
             history["ll_outer"].append(float(ll_val.detach().cpu().item()))
+        t_warp1 = time.perf_counter()
 
+        t_mstep0 = time.perf_counter()
         for _ in range(grad_steps):
             psi = torch.nn.functional.softplus(psi_raw) + 1e-4
             s = torch.nn.functional.softplus(s_raw) + 1e-4
@@ -517,7 +546,9 @@ def run_em_like(
                 # B-spline bases form a partition of unity, so adding the same constant to every
                 # control point shifts log_a2(t) by that constant for all t (up to numerical error).
                 C.data -= mean_log.squeeze(1).unsqueeze(-1)
+        t_mstep1 = time.perf_counter()
 
+        t_post0 = time.perf_counter()
         with torch.no_grad():
             psi = torch.nn.functional.softplus(psi_raw) + 1e-4
             s = torch.nn.functional.softplus(s_raw) + 1e-4
@@ -529,6 +560,15 @@ def run_em_like(
             else:
                 ll_post = factor_log_likelihood(Y, M_mask, L, psi, s, a2)
             history["ll_post_m"].append(float(ll_post.detach().cpu().item()))
+        t_post1 = time.perf_counter()
+
+        t_outer1 = time.perf_counter()
+        history["t_estep_s"].append(float(t_estep1 - t_estep0))
+        history["t_warp_s"].append(float(t_warp1 - t_warp0))
+        history["t_mstep_s"].append(float(t_mstep1 - t_mstep0))
+        history["t_post_s"].append(float(t_post1 - t_post0))
+        history["t_outer_total_s"].append(float(t_outer1 - t_outer0))
+        history["t_total_s"].append(float(t_outer1 - t_start))
 
         if prev_ll is not None and torch.abs(ll_val - prev_ll) < 1e-3:
             break
@@ -545,3 +585,209 @@ def run_em_like(
     if return_history:
         return L, a2, psi, s, C, u_tilde, F_tilde, history
     return L, a2, psi, s, C, u_tilde, F_tilde
+
+def split_cal_test_from_train_and_pmiss(
+    train_idx: np.ndarray,
+    p_miss: np.ndarray,
+    *,
+    seed: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Given a fixed `train_idx` (flatten convention k=i*(J*T)+j*T+t),
+    resample which remaining points are *test* using per-point missing probabilities `p_miss`.
+
+    - `test_idx` is sampled from all points NOT in `train_idx` using Bernoulli(p_miss[k]).
+    - `cal_idx` is the complement: all points not in train and not in test.
+
+    Parameters
+    ----------
+    train_idx:
+        1D integer array of flattened indices (k=i*(J*T)+j*T+t).
+    p_miss:
+        Missing probabilities. Accepts either:
+          - shape (I,T,J) aligned to Y/M in this project, or
+          - flat shape (I*J*T,) aligned to the flatten convention.
+    seed / rng:
+        Randomness control. If `rng` is provided it is used; else `seed` creates a new RNG.
+
+    Returns
+    -------
+    cal_idx, test_idx:
+        1D integer arrays (disjoint), both excluding `train_idx`.
+    """
+    train_idx = np.asarray(train_idx, dtype=int).ravel()
+    if train_idx.size == 0:
+        raise ValueError("train_idx is empty")
+    if rng is None:
+        rng = np.random.default_rng(seed)
+
+    P = np.asarray(p_miss, dtype=float)
+    if P.ndim == 3:
+        # (I,T,J) -> flatten in (I,J,T) order to match k=i*(J*T)+j*T+t
+        I, T, J = P.shape
+        P_flat = np.transpose(P, (0, 2, 1)).reshape(-1)
+        n_total = I * J * T
+    elif P.ndim == 1:
+        P_flat = P.ravel()
+        n_total = int(P_flat.size)
+    else:
+        raise ValueError("p_miss must have shape (I,T,J) or (I*J*T,)")
+
+    if np.any(~np.isfinite(P_flat)):
+        raise ValueError("p_miss contains non-finite values")
+    P_flat = np.clip(P_flat, 0.0, 1.0)
+
+    if np.any(train_idx < 0) or np.any(train_idx >= n_total):
+        raise ValueError(f"train_idx contains values outside [0, {n_total-1}]")
+
+    # Exclude train points, then sample test among the remaining points.
+    in_train = np.zeros(n_total, dtype=bool)
+    in_train[np.unique(train_idx)] = True
+    remaining = np.flatnonzero(~in_train)
+    u = rng.uniform(size=remaining.size)
+    is_test = u < P_flat[remaining]
+    test_idx = remaining[is_test].astype(int)
+    cal_idx = remaining[~is_test].astype(int)
+    return cal_idx, test_idx
+
+def _as_1d(x: np.ndarray | Iterable[float], name: str) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError(f"{name} must be 1D, got shape {x.shape}")
+    return x
+
+
+def _quantile_edges(values: np.ndarray, n_bins: int, quantiles: Optional[np.ndarray] = None) -> np.ndarray:
+    if quantiles is None:
+        quantiles = np.linspace(0.0, 1.0, n_bins + 1)
+    quantiles = np.asarray(quantiles, dtype=float)
+    if quantiles.ndim != 1 or quantiles.size < 2:
+        raise ValueError("quantiles must be a 1D array with at least 2 elements")
+    if not (np.isclose(quantiles[0], 0.0) and np.isclose(quantiles[-1], 1.0)):
+        raise ValueError("quantiles should start at 0 and end at 1")
+    edges = np.quantile(values, quantiles)
+    return edges
+
+
+def binned_interval_stats_by_quantiles(
+    *,
+    values: np.ndarray | Iterable[float],
+    y_true: np.ndarray | Iterable[float],
+    lower: np.ndarray | Iterable[float],
+    upper: np.ndarray | Iterable[float],
+    n_bins: int = 10,
+    quantiles: Optional[np.ndarray] = None,
+    name: str = "value",
+) -> Dict[str, Any]:
+    """
+    Compute conditional coverage and average interval length by quantile bins of `values`.
+
+    Args:
+        values: 1D array used for partitioning (e.g., time, y_true, abs residual, sigma).
+        y_true: 1D array of true outcomes for the same points.
+        lower, upper: 1D arrays of prediction interval bounds for the same points.
+        n_bins: number of quantile bins if `quantiles` is None.
+        quantiles: optional explicit quantile grid (length n_bins+1). Must start at 0 and end at 1.
+        name: label for this partitioning variable (used in output).
+
+    Returns:
+        dict with:
+          - name: variable name
+          - edges: array (n_bins+1,) of bin edges
+          - rows: list of dicts with per-bin stats:
+              bin, left, right, n, coverage, avg_length, avg_value, avg_y
+    """
+    v = _as_1d(values, "values")
+    y = _as_1d(y_true, "y_true")
+    lo = _as_1d(lower, "lower")
+    hi = _as_1d(upper, "upper")
+    if not (v.size == y.size == lo.size == hi.size):
+        raise ValueError("values, y_true, lower, upper must have the same length")
+    if v.size == 0:
+        return {"name": name, "edges": np.array([]), "rows": []}
+
+    length = hi - lo
+    covered = (y >= lo) & (y <= hi)
+
+    edges = _quantile_edges(v, n_bins=n_bins, quantiles=quantiles)
+    # Assign bins using interior edges; last edge is inclusive.
+    bin_id = np.searchsorted(edges[1:-1], v, side="right")  # 0..n_bins-1
+
+    rows: List[Dict[str, Any]] = []
+    n_bins_eff = edges.size - 1
+    for b in range(n_bins_eff):
+        m = bin_id == b
+        nb = int(np.sum(m))
+        left = float(edges[b])
+        right = float(edges[b + 1])
+        if nb == 0:
+            rows.append(
+                dict(
+                    bin=b,
+                    left=left,
+                    right=right,
+                    n=0,
+                    coverage=float("nan"),
+                    avg_length=float("nan"),
+                    avg_value=float("nan"),
+                    avg_y=float("nan"),
+                )
+            )
+            continue
+        rows.append(
+            dict(
+                bin=b,
+                left=left,
+                right=right,
+                n=nb,
+                coverage=float(np.mean(covered[m])),
+                avg_length=float(np.mean(length[m])),
+                avg_value=float(np.mean(v[m])),
+                avg_y=float(np.mean(y[m])),
+            )
+        )
+
+    return {"name": name, "edges": edges, "rows": rows}
+
+
+def conditional_interval_report(
+    *,
+    y_true: np.ndarray | Iterable[float],
+    lower: np.ndarray | Iterable[float],
+    upper: np.ndarray | Iterable[float],
+    x: Optional[np.ndarray | Iterable[float]] = None,
+    y_hat: Optional[np.ndarray | Iterable[float]] = None,
+    n_bins: int = 10,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Convenience wrapper: compute binned stats for common partition variables:
+      - X (if provided)
+      - Y (always)
+      - |residual| (if y_hat provided)
+
+    Returns a dict mapping keys {"X","Y","abs_resid"} -> binned stats dict.
+    """
+    y = _as_1d(y_true, "y_true")
+    lo = _as_1d(lower, "lower")
+    hi = _as_1d(upper, "upper")
+    if not (y.size == lo.size == hi.size):
+        raise ValueError("y_true, lower, upper must have the same length")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    out["Y"] = binned_interval_stats_by_quantiles(values=y, y_true=y, lower=lo, upper=hi, n_bins=n_bins, name="Y")
+
+    if x is not None:
+        xv = _as_1d(x, "x")
+        out["X"] = binned_interval_stats_by_quantiles(values=xv, y_true=y, lower=lo, upper=hi, n_bins=n_bins, name="X")
+
+    if y_hat is not None:
+        yh = _as_1d(y_hat, "y_hat")
+        if yh.size != y.size:
+            raise ValueError("y_hat must have same length as y_true")
+        abs_resid = np.abs(y - yh)
+        out["abs_resid"] = binned_interval_stats_by_quantiles(
+            values=abs_resid, y_true=y, lower=lo, upper=hi, n_bins=n_bins, name="abs_resid"
+        )
+
+    return out

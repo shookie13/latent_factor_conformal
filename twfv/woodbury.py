@@ -4,7 +4,7 @@ Woodbury + determinant-lemma engine for the factor model with diagonal factor co
 We observe (possibly masked) channel residuals y_{i,t} in R^{J_obs}:
 
     y = L_obs f + u
-    f ~ N(0, A),        A = diag(a2)  (r x r)
+    f ~ N(0, kappa_i * A),  A = diag(a2)  (r x r)
     u ~ N(0, s_i^2 D),  D = diag(psi_obs) (J_obs x J_obs)
 
 Then the observed covariance is:
@@ -26,12 +26,12 @@ Let:
 
 Define the small SPD matrix:
 
-    S = A^{-1} + s^{-2} G                              (r x r)
+    S = (kappa_i A)^{-1} + s^{-2} G                    (r x r)
 
 Then (Woodbury + determinant lemma) give:
 
     log|H| = log|s^2 D| + log|A| + log|S|
-           = J_obs*log(s^2) + log|D| + sum_k log(a2_k) + log|S|.
+           = J_obs*log(s^2) + log|D| + sum_k log(kappa_i a2_k) + log|S|.
 
 and
 
@@ -123,6 +123,7 @@ def factor_E_step_woodbury(
     L: torch.Tensor,
     psi: torch.Tensor,
     s: torch.Tensor,
+    kappa: torch.Tensor | None,
     a2: torch.Tensor,
     *,
     pattern_groups: List[PatternGroup] | None = None,
@@ -138,6 +139,7 @@ def factor_E_step_woodbury(
         L: (J, r)
         psi: (J,) positive
         s: (I,) positive
+        kappa: (I,) positive subject factor scales. If None, treated as ones.
         a2: (I, T, r) positive factor variances
         pattern_groups: optional precomputed pattern groups from build_pattern_groups(M_mask)
         eps: numerical epsilon
@@ -187,7 +189,12 @@ def factor_E_step_woodbury(
         V = Z @ W  # (n, r)  where V[row]=W^T z
         z2 = (Z * Z).sum(dim=1)  # (n,)
 
+        # Effective factor variances for this pattern:
+        #   A_eff[i,t,k] = kappa[i] * a2[i,t,k]
         A_rows = a2_flat.index_select(0, flat)  # (n, r)
+        if kappa is not None:
+            kap = kappa.index_select(0, i_idx).to(dtype=dtype, device=device)  # (n,)
+            A_rows = A_rows * kap.unsqueeze(1)
         s2 = (s.index_select(0, i_idx) ** 2)  # (n,)
 
         invA = 1.0 / (A_rows + eps)  # (n, r)
@@ -231,6 +238,7 @@ def factor_log_likelihood_woodbury(
     L: torch.Tensor,
     psi: torch.Tensor,
     s: torch.Tensor,
+    kappa: torch.Tensor | None,
     a2: torch.Tensor,
     *,
     pattern_groups: List[PatternGroup] | None = None,
@@ -241,7 +249,7 @@ def factor_log_likelihood_woodbury(
     Log-likelihood-only version (still computes the same terms but does not return F_tilde).
     """
     _, ll = factor_E_step_woodbury(
-        Y, M_mask, L, psi, s, a2, pattern_groups=pattern_groups, eps=eps, jitter=jitter
+        Y, M_mask, L, psi, s, kappa, a2, pattern_groups=pattern_groups, eps=eps, jitter=jitter
     )
     return ll
 

@@ -53,6 +53,280 @@ def _quantile_higher(scores: np.ndarray, alpha: float) -> float:
         return float(np.quantile(scores, q_level, interpolation="higher"))
 
 
+def _nanmedian_1d(x: np.ndarray, *, default: float) -> float:
+    x = np.asarray(x, dtype=float).ravel()
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return float(default)
+    return float(np.median(x))
+
+
+def _quantile_higher_values(values: np.ndarray, q: float, *, default: float) -> float:
+    """
+    Conservative ("higher") quantile lookup on raw values.
+    """
+    values = np.asarray(values, dtype=float).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float(default)
+    qq = float(np.clip(q, 0.0, 1.0))
+    try:
+        return float(np.quantile(values, qq, method="higher"))
+    except TypeError:  # NumPy < 1.22
+        return float(np.quantile(values, qq, interpolation="higher"))
+
+
+class CPTDRSplitConformalCP:
+    """
+    CPTD-R: Ratio-to-median-residual normalization (Lin et al., 2022).
+
+    This implements the *normalized absolute residual* nonconformity scores from:
+      "Conformal Prediction Intervals with Temporal Dependence", Lin et al. (2022),
+    Section 4.3 and Algorithm 1 (CPTD-R), adapted to this repo's index convention.
+
+    Key idea
+    --------
+    For each univariate time series (by default: each (subject i, channel j) pair),
+    construct a time-varying normalizer m_hat[s,t] from past residuals and
+    cross-sectional information, and use the score:
+
+        V[s,t] = |y[s,t] - yhat[s,t]| / m_hat[s,t]
+
+    Then perform split conformal *per time step* t (cross-sectional across series).
+
+    Notes / adaptation details
+    --------------------------
+    The original paper considers N calibration time series + 1 test time series and
+    constructs a PI at each time t+1 using scores at that time. Our implementation
+    supports predicting many points across many series/time steps by:
+      - building residual histories from the provided calibration set (and optional
+        additional "history" points that you want to use only for normalization),
+      - calibrating a quantile per time step from calibration points at that time,
+      - using yhat ± q_t * m_hat for test points at time t.
+    """
+
+    def __init__(
+        self,
+        shape_ref: np.ndarray,
+        J: int,
+        alpha: float = 0.1,
+        *,
+        series_mode: str = "ij",  # "ij" (default) or "i"
+        lambda_prior: float = 1.0,
+        eps: float = 1e-12,
+        m_min: float = 1e-6,
+    ):
+        self.J = int(J)
+        self.alpha = float(alpha)
+        self.I = int(shape_ref.shape[0])
+        self.T = int(shape_ref.shape[1])
+        self.series_mode = str(series_mode)
+        self.lambda_prior = float(lambda_prior)
+        self.eps = float(eps)
+        self.m_min = float(m_min)
+
+        self._m_hat: Optional[np.ndarray] = None          # (S,T)
+        self._scores_by_t: Optional[list[np.ndarray]] = None  # length T, arrays of scores on CAL at time t
+
+    def fit(self, X_obs_idx: np.ndarray, Y_obs: np.ndarray) -> None:
+        raise NotImplementedError("No internal model. Use calibrate_from_fit().")
+
+    def calibrate(self, X_cal_idx: np.ndarray, Y_cal: np.ndarray) -> None:
+        raise NotImplementedError("Use calibrate_from_fit(true, fit).")
+
+    def predict_interval(self, X_test_idx: np.ndarray, alpha: float) -> np.ndarray:
+        raise NotImplementedError("Use predict_interval_from_fit(fit).")
+
+    def _series_id(self, i: int, j: int) -> int:
+        if self.series_mode == "ij":
+            return int(i) * int(self.J) + int(j)
+        if self.series_mode == "i":
+            # Only sensible if you're running on a single channel; otherwise multiple channels collide.
+            return int(i)
+        raise ValueError(f"Unknown series_mode={self.series_mode!r}. Use 'ij' or 'i'.")
+
+    def _n_series(self) -> int:
+        return int(self.I * self.J) if self.series_mode == "ij" else int(self.I)
+
+    def _build_abs_residual_matrix(
+        self,
+        X_idx: np.ndarray,
+        Y_true: np.ndarray,
+        Y_fit: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Build R[s,t] = |y - yhat| for the provided indices, NaN elsewhere.
+        """
+        X_idx = np.asarray(X_idx, dtype=int).ravel()
+        Y_true = np.asarray(Y_true, dtype=float).ravel()
+        Y_fit = np.asarray(Y_fit, dtype=float).ravel()
+        if not (X_idx.size == Y_true.size == Y_fit.size):
+            raise ValueError("X_idx, Y_true, Y_fit must have the same length")
+
+        S = self._n_series()
+        R = np.full((S, self.T), np.nan, dtype=float)
+        abs_res = np.abs(Y_true - Y_fit)
+        for k, r in zip(X_idx.tolist(), abs_res.tolist()):
+            i, j, t = unflatten(int(k), self.I, self.J, self.T)
+            s = self._series_id(i, j)
+            R[s, int(t)] = float(r)
+        return R
+
+    def _compute_m_hat(self, R_abs: np.ndarray) -> np.ndarray:
+        """
+        Compute m_hat[s,t] following Lin et al. (2022) Eq (14)-(17) / Algorithm 1,
+        with NaN-aware handling for missing residuals.
+        """
+        R_abs = np.asarray(R_abs, dtype=float)
+        S, T = R_abs.shape
+        if T != self.T:
+            raise ValueError("R_abs has incompatible T")
+
+        # (14) median per time step over cross-section (series)
+        m_med = np.array([_nanmedian_1d(R_abs[:, t], default=1.0) for t in range(T)], dtype=float)
+        m_med = np.maximum(m_med, self.m_min)  # avoid 0
+
+        # u[s,t] = |r| / m_med[t]
+        u = R_abs / m_med[None, :]
+
+        # (15) expanding mean of u (NaN-aware)
+        is_obs = np.isfinite(u)
+        u0 = np.where(is_obs, u, 0.0)
+        cs = np.cumsum(u0, axis=1)
+        cnt = np.cumsum(is_obs.astype(float), axis=1)
+        nr = np.where(cnt > 0, cs / np.maximum(cnt, 1.0), np.nan)  # (S,T)
+
+        # Empirical CDF Fs(|r_{s,t}|) over series at each t (NaN-aware)
+        Fvals = np.full((S, T), np.nan, dtype=float)
+        for t in range(T):
+            vals = R_abs[:, t]
+            vals = vals[np.isfinite(vals)]
+            n = int(vals.size)
+            if n == 0:
+                continue
+            vals_sorted = np.sort(vals)
+            # For each series with a value, compute rank percentile (# <= x)/n
+            col = R_abs[:, t]
+            mask = np.isfinite(col)
+            ranks = np.searchsorted(vals_sorted, col[mask], side="right").astype(float) / float(n)
+            Fvals[mask, t] = ranks
+
+        lam = float(self.lambda_prior)
+        # (17) qhat[s,t] uses past times < t
+        qhat = np.full((S, T), 0.5, dtype=float)
+        for t in range(1, T):
+            past = Fvals[:, :t]  # (S,t)
+            sumF = np.nansum(past, axis=1)
+            cntF = np.sum(np.isfinite(past), axis=1).astype(float)
+            qhat[:, t] = (0.5 * lam + sumF) / (cntF + lam)
+        qhat = np.clip(qhat, 0.0, 1.0)
+
+        # (16) m_hat[s,t] = Q(qhat[s,t], {nr[*,t-1]})
+        m_hat = np.ones((S, T), dtype=float)
+        for t in range(1, T):
+            dist = nr[:, t - 1]
+            dist = dist[np.isfinite(dist)]
+            if dist.size == 0:
+                continue
+            for s in range(S):
+                m_hat[s, t] = _quantile_higher_values(dist, qhat[s, t], default=1.0)
+
+        m_hat = np.maximum(m_hat, self.m_min)
+        return m_hat
+
+    def calibrate_from_fit(
+        self,
+        X_cal_idx: np.ndarray,
+        Y_cal_true: np.ndarray,
+        Y_cal_fit: np.ndarray,
+        *,
+        X_hist_idx: Optional[np.ndarray] = None,
+        Y_hist_true: Optional[np.ndarray] = None,
+        Y_hist_fit: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Calibrate CPTD-R using calibration indices at various times.
+
+        Optional: provide additional "history" points (X_hist_idx, Y_hist_true, Y_hist_fit)
+        that are used only to build residual histories / normalizers (m_hat), but are NOT
+        included as calibration scores when computing quantiles.
+        """
+        X_cal_idx = np.asarray(X_cal_idx, dtype=int).ravel()
+        Y_cal_true = np.asarray(Y_cal_true, dtype=float).ravel()
+        Y_cal_fit = np.asarray(Y_cal_fit, dtype=float).ravel()
+        if not (X_cal_idx.size == Y_cal_true.size == Y_cal_fit.size):
+            raise ValueError("X_cal_idx, Y_cal_true, Y_cal_fit must have the same length")
+
+        if X_hist_idx is not None:
+            if Y_hist_true is None or Y_hist_fit is None:
+                raise ValueError("If X_hist_idx is provided, provide Y_hist_true and Y_hist_fit as well.")
+            X_hist_idx = np.asarray(X_hist_idx, dtype=int).ravel()
+            Y_hist_true = np.asarray(Y_hist_true, dtype=float).ravel()
+            Y_hist_fit = np.asarray(Y_hist_fit, dtype=float).ravel()
+            if not (X_hist_idx.size == Y_hist_true.size == Y_hist_fit.size):
+                raise ValueError("X_hist_idx, Y_hist_true, Y_hist_fit must have the same length")
+
+            X_all = np.concatenate([X_cal_idx, X_hist_idx])
+            Y_all_true = np.concatenate([Y_cal_true, Y_hist_true])
+            Y_all_fit = np.concatenate([Y_cal_fit, Y_hist_fit])
+        else:
+            X_all, Y_all_true, Y_all_fit = X_cal_idx, Y_cal_true, Y_cal_fit
+
+        R_all = self._build_abs_residual_matrix(X_all, Y_all_true, Y_all_fit)
+        m_hat = self._compute_m_hat(R_all)
+        self._m_hat = m_hat
+
+        # Store calibration scores by time t (only using CAL points)
+        S = self._n_series()
+        scores_by_t: list[list[float]] = [[] for _ in range(self.T)]
+        abs_res_cal = np.abs(Y_cal_true - Y_cal_fit)
+        for k, r in zip(X_cal_idx.tolist(), abs_res_cal.tolist()):
+            i, j, t = unflatten(int(k), self.I, self.J, self.T)
+            s = self._series_id(i, j)
+            denom = float(m_hat[s, int(t)]) if np.isfinite(m_hat[s, int(t)]) else 1.0
+            scores_by_t[int(t)].append(float(r) / max(denom, self.m_min))
+
+        self._scores_by_t = [np.asarray(v, dtype=float) for v in scores_by_t]
+
+    def predict_interval_from_fit(self, X_test_idx: np.ndarray, Y_test_fit: np.ndarray, alpha: float) -> np.ndarray:
+        if self._m_hat is None or self._scores_by_t is None:
+            raise RuntimeError("Call calibrate_from_fit before prediction.")
+
+        X_test_idx = np.asarray(X_test_idx, dtype=int).ravel()
+        Y_test_fit = np.asarray(Y_test_fit, dtype=float).ravel()
+        if X_test_idx.size != Y_test_fit.size:
+            raise ValueError("X_test_idx and Y_test_fit must have the same length")
+
+        a = float(alpha)
+        out = np.zeros((X_test_idx.size, 2), dtype=float)
+
+        # Pre-compute per-time quantiles from stored calibration scores
+        q_by_t = np.full(self.T, np.nan, dtype=float)
+        for t in range(self.T):
+            sc = self._scores_by_t[t]
+            if sc.size > 0:
+                q_by_t[t] = _quantile_higher(sc, a)
+
+        # Fallback: global quantile across all times
+        all_scores = np.concatenate([sc for sc in self._scores_by_t if sc.size > 0], axis=0) if any(
+            sc.size > 0 for sc in self._scores_by_t
+        ) else np.array([], dtype=float)
+        q_global = _quantile_higher(all_scores, a) if all_scores.size > 0 else 0.0
+        if not np.isfinite(q_global):
+            q_global = 0.0
+
+        for n, k in enumerate(X_test_idx.tolist()):
+            i, j, t = unflatten(int(k), self.I, self.J, self.T)
+            s = self._series_id(i, j)
+            denom = float(self._m_hat[s, int(t)]) if np.isfinite(self._m_hat[s, int(t)]) else 1.0
+            denom = max(denom, self.m_min)
+            q = float(q_by_t[int(t)]) if np.isfinite(q_by_t[int(t)]) else float(q_global)
+            yhat = float(Y_test_fit[n])
+            out[n, 0] = yhat - q * denom
+            out[n, 1] = yhat + q * denom
+        return out
+
+
 class NaiveAbsoluteResidualCP:
     """
     Global split conformal using absolute residuals; expects external fitted means.

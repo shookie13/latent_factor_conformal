@@ -21,7 +21,7 @@ I, T, J, r, M_ctrl = 4, 20, 6, 2, 6
 Y = torch.randn(I, T, J)
 M_mask = torch.ones_like(Y, dtype=torch.bool)
 
-L, psi, s, C, u_tilde, F_tilde = run_em_like(
+L, a2, psi, s, kappa, C, u_tilde, F_tilde, history = run_em_like(
     Y, M_mask, r=r, M_ctrl=M_ctrl, degree=3,
     max_outer=5, grad_steps=2, lr=1e-2, device="cpu"
 )
