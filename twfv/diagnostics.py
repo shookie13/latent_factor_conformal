@@ -8,7 +8,7 @@ This module is intentionally light-weight: it provides summaries that help answe
 """
 
 from __future__ import annotations
-
+from scipy.stats import ks_2samp
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -380,22 +380,27 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
         sigma_test_oracle = sigma_oracle_flat[test_idx]
         sigma_cal_avg = 0.5 * (sigma_cal + sigma_cal_oracle)
         sigma_test_avg = 0.5 * (sigma_test + sigma_test_oracle)
-        q95 = scipy.stats.norm.ppf(0.95)
-        lower_oracle = -q95 * sigma_test_oracle+Y_test_fit
-        upper_oracle =  q95 * sigma_test_oracle+Y_test_fit
-        lower_avg = -q95 * sigma_test_avg+Y_test_fit
-        upper_avg =  q95 * sigma_test_avg+Y_test_fit
+        # q95 = scipy.stats.norm.ppf(0.95)
+        # lower_oracle = -q95 * sigma_test_oracle+Y_test_fit
+        # upper_oracle =  q95 * sigma_test_oracle+Y_test_fit
+        # lower_avg = -q95 * sigma_test_avg+Y_test_fit
+        # upper_avg =  q95 * sigma_test_avg+Y_test_fit
         # CP intervals
         lower_tmfv, upper_tmfv, q_tmfv = conformal_scaled_abs(
             Y_cal_true, Y_cal_fit, sigma_cal, Y_test_fit, sigma_test, alpha=alpha
         )
-        # lower_oracle, upper_oracle, q_oracle = conformal_scaled_abs(
-        #     Y_cal_true, Y_cal_fit, sigma_cal_oracle, Y_test_fit, sigma_test_oracle, alpha=alpha
-        # )
-        # lower_avg, upper_avg, q_avg = conformal_scaled_abs(
-        #     Y_cal_true, Y_cal_fit, sigma_cal_avg, Y_test_fit, sigma_test_avg, alpha=alpha
-        # )
-
+        lower_oracle, upper_oracle, q_cal_oracle = conformal_scaled_abs(
+            Y_cal_true, Y_cal_fit, sigma_cal_oracle, Y_test_fit, sigma_test_oracle, alpha=alpha
+        )
+        lower_avg, upper_avg, q_avg = conformal_scaled_abs(
+            Y_cal_true, Y_cal_fit, sigma_cal_avg, Y_test_fit, sigma_test_avg, alpha=alpha
+        )
+        S_cal_oracle = np.abs(Y_cal_true - Y_cal_fit) / sigma_cal_oracle
+        S_test_oracle = np.abs(Y_test_true - Y_test_fit) / sigma_test_oracle
+        delta_mean = S_test_oracle.mean() - S_cal_oracle.mean()
+        q_test_oracle = _quantile_higher(S_test_oracle, alpha=float(alpha))
+        delta_q = q_test_oracle - q_cal_oracle
+        D, pval = ks_2samp(S_test_oracle, S_cal_oracle, alternative="two-sided", method="auto")
         covered_tmfv = (Y_test_true >= lower_tmfv) & (Y_test_true <= upper_tmfv)
         covered_oracle = (Y_test_true >= lower_oracle) & (Y_test_true <= upper_oracle)
         covered_avg = (Y_test_true >= lower_avg) & (Y_test_true <= upper_avg)
@@ -438,8 +443,12 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
                 sigma_test_avg=sigma_test_avg,
                 # intervals & coverage
                 q_tmfv=float(q_tmfv),
-                q_oracle=float(q95),
-                q_avg=float(q95),
+                q_oracle=float(q_cal_oracle),
+                q_avg=float(q_avg),
+                delta_mean=float(delta_mean),
+                delta_q=float(delta_q),
+                D=float(D),
+                pval=float(pval),
                 lower_tmfv=lower_tmfv,
                 upper_tmfv=upper_tmfv,
                 lower_oracle=lower_oracle,

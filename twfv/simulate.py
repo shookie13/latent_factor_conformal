@@ -314,6 +314,7 @@ def simulate_factor_data_bspline(
     M_ctrl: int,
     degree: int = 3,
     seed: int = 0,
+    f_var: bool = True,
     X_true: Optional[np.ndarray] = None,  # (J, r)
     Psi_true: Optional[np.ndarray] = None,  # (J,)
     s_true: Optional[np.ndarray] = None,  # (I,)
@@ -418,17 +419,20 @@ def simulate_factor_data_bspline(
             # var_f = kappa_true[i] * a2_true[i, t_idx, :]
             #   where var_f[k] = \kappa_i * a^2_{i, t, k}
             var_f = kappa_true[i] * a2_true[i, t_idx, :]  # (r,) elementwise
-            var_fs[i, t_idx, :] = var_f
-            # F_it ~ N(0, diag(var_f)), so F_it[k] ~ N(0, var_f[k]) for k = 0,...,r-1
-            F_it = rng.normal(loc=0.0, scale=np.sqrt(var_f), size=r)  # (r,)
-
-            # u_it ~ N(0, s_true[i]^2 * diag(Psi_true)), so u_it[j] ~ N(0, s_true[i]^2 * Psi_true[j])
-            u_it = rng_noise.normal(loc=0.0, scale=s_true[i] * np.sqrt(Psi_true), size=J)  # (J,)
-
-            # e_it = X_true @ F_it + u_it  (dim: J = X_true (J,r) @ F_it (r,) + u_it (J,))
-            #   Y[i, t, :] = e_it
-            e_it = X_true @ F_it + u_it
-            Y[i, t_idx, :] = e_it
+            if f_var:
+                v_ch = (X_true**2) @ var_f                                 # (J,)
+                v_y  = v_ch + (s_true[i]**2) * Psi_true                    # (J,)
+                Y[i, t_idx, :] = rng.normal(0.0, np.sqrt(v_y), size=J)     # independent across channels
+            else:
+                var_fs[i, t_idx, :] = var_f
+                # F_it ~ N(0, diag(var_f)), so F_it[k] ~ N(0, var_f[k]) for k = 0,...,r-1
+                F_it = rng.normal(loc=0.0, scale=np.sqrt(var_f), size=r)  # (r,)
+                # u_it ~ N(0, s_true[i]^2 * diag(Psi_true)), so u_it[j] ~ N(0, s_true[i]^2 * Psi_true[j])
+                u_it = rng_noise.normal(loc=0.0, scale=s_true[i] * np.sqrt(Psi_true), size=J)  # (J,)
+                # e_it = X_true @ F_it + u_it  (dim: J = X_true (J,r) @ F_it (r,) + u_it (J,))
+                #   Y[i, t, :] = e_it
+                e_it = X_true @ F_it + u_it
+                Y[i, t_idx, :] = e_it
 
             if use_variance_tied_missing:
                 p_miss = missing_prob_from_factor_variance(var_f, X_true)

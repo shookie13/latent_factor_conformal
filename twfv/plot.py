@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import os
 import re
 import matplotlib.colors as mcolors
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 def unflatten(k: int, I: int, J: int, T: int) -> Tuple[int, int, int]:
     """
@@ -2231,6 +2231,7 @@ def build_methods_macro_table_from_artifacts(
     # Coverage/score config
     alpha_target: Optional[float] = None,
     coverage_tol: float = 0.005,
+    panel_a_mode: str = "coverage",  # "coverage" | "coverage_gap"
     # Output formatting
     digits_cov: int = 3,
     digits_score: int = 2,
@@ -2242,7 +2243,7 @@ def build_methods_macro_table_from_artifacts(
     Build the "main table" described in the prompt from `artifacts`.
 
     Two stacked panels:
-      - Panel A: macro-averaged coverage (and Δ = coverage - target) with mean±sd over runs
+      - Panel A: macro-averaged coverage (and Δ) or coverage gap (|coverage-target|), per panel_a_mode
       - Panel B: macro-averaged interval score (lower is better) with mean±sd over runs
 
     Rows (partition types):
@@ -2263,6 +2264,9 @@ def build_methods_macro_table_from_artifacts(
         raise ValueError("n_time_bins must be >= 2")
     if int(min_group_size) < 1:
         raise ValueError("min_group_size must be >= 1")
+    panel_a_mode_use = str(panel_a_mode).strip().lower()
+    if panel_a_mode_use not in ("coverage", "coverage_gap"):
+        raise ValueError("panel_a_mode must be 'coverage' or 'coverage_gap'")
 
     def _sanitize(s: str) -> str:
         s = re.sub(r"[^A-Za-z0-9._-]+", "_", s.strip())
@@ -2304,6 +2308,29 @@ def build_methods_macro_table_from_artifacts(
         if not np.any(keep):
             return float("nan")
         return float(np.mean(mean_g[keep]))
+
+    def macro_mean_gap_by_group(
+        covered: np.ndarray, group: np.ndarray, *, target: float, min_n: int
+    ) -> float:
+        """Macro-avg of |per-group coverage - target| over groups with n>=min_n."""
+        cov = np.asarray(covered, dtype=float).ravel()
+        g = np.asarray(group, dtype=int).ravel()
+        if cov.size != g.size:
+            raise ValueError("macro_mean_gap_by_group: covered and group must have same length")
+        if cov.size == 0:
+            return float("nan")
+        K = int(np.max(g)) + 1 if g.size else 0
+        if K <= 0:
+            return float("nan")
+        cnt = np.bincount(g, minlength=K).astype(float)
+        s = np.bincount(g, weights=cov, minlength=K).astype(float)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cov_g = s / cnt
+        gap_g = np.abs(cov_g - float(target))
+        keep = (cnt >= float(min_n)) & np.isfinite(gap_g)
+        if not np.any(keep):
+            return float("nan")
+        return float(np.mean(gap_g[keep]))
 
     # --- infer methods ---
     if method_specs is None:
@@ -2351,6 +2378,7 @@ def build_methods_macro_table_from_artifacts(
 
     # Per-run macro aggregates: dict[row][method] -> list[float] over runs
     cov_runs: Dict[str, Dict[str, List[float]]] = {rn: {m: [] for m in methods} for rn in row_names}
+    gap_runs: Dict[str, Dict[str, List[float]]] = {rn: {m: [] for m in methods} for rn in row_names}
     sc_runs: Dict[str, Dict[str, List[float]]] = {rn: {m: [] for m in methods} for rn in row_names}
 
     for art in artifacts:
@@ -2393,22 +2421,29 @@ def build_methods_macro_table_from_artifacts(
 
             # Overall (macro==micro)
             cov_runs["Overall"][m].append(float(np.mean(cov_point)) if cov_point.size else float("nan"))
+            cov_mean_overall = float(np.mean(cov_point)) if cov_point.size else float("nan")
+            gap_runs["Overall"][m].append(float(np.abs(cov_mean_overall - target)) if np.isfinite(cov_mean_overall) else float("nan"))
             sc_runs["Overall"][m].append(float(np.mean(sc_point)) if sc_point.size else float("nan"))
 
             # Macro across groups
             cov_runs["Time bins"][m].append(macro_mean_by_group(cov_point, tb, min_n=min_group_size))
+            gap_runs["Time bins"][m].append(macro_mean_gap_by_group(cov_point, tb, target=target, min_n=min_group_size))
             sc_runs["Time bins"][m].append(macro_mean_by_group(sc_point, tb, min_n=min_group_size))
 
             cov_runs["Channel"][m].append(macro_mean_by_group(cov_point, chan, min_n=min_group_size))
+            gap_runs["Channel"][m].append(macro_mean_gap_by_group(cov_point, chan, target=target, min_n=min_group_size))
             sc_runs["Channel"][m].append(macro_mean_by_group(sc_point, chan, min_n=min_group_size))
 
             cov_runs["Subject"][m].append(macro_mean_by_group(cov_point, subj, min_n=min_group_size))
+            gap_runs["Subject"][m].append(macro_mean_gap_by_group(cov_point, subj, target=target, min_n=min_group_size))
             sc_runs["Subject"][m].append(macro_mean_by_group(sc_point, subj, min_n=min_group_size))
 
             cov_runs["Time × Subject"][m].append(macro_mean_by_group(cov_point, g_time_subject, min_n=min_group_size))
+            gap_runs["Time × Subject"][m].append(macro_mean_gap_by_group(cov_point, g_time_subject, target=target, min_n=min_group_size))
             sc_runs["Time × Subject"][m].append(macro_mean_by_group(sc_point, g_time_subject, min_n=min_group_size))
 
             cov_runs["Channel × Subject"][m].append(macro_mean_by_group(cov_point, g_chan_subject, min_n=min_group_size))
+            gap_runs["Channel × Subject"][m].append(macro_mean_gap_by_group(cov_point, g_chan_subject, target=target, min_n=min_group_size))
             sc_runs["Channel × Subject"][m].append(macro_mean_by_group(sc_point, g_chan_subject, min_n=min_group_size))
 
     # Aggregate across runs
@@ -2420,23 +2455,36 @@ def build_methods_macro_table_from_artifacts(
     target_line = 1.0 - float(alpha_line) if (0.0 < alpha_line < 1.0) else float("nan")
 
     cov_stats: Dict[str, Dict[str, Dict[str, float]]] = {rn: {} for rn in row_names}
+    gap_stats: Dict[str, Dict[str, Dict[str, float]]] = {rn: {} for rn in row_names}
     sc_stats: Dict[str, Dict[str, Dict[str, float]]] = {rn: {} for rn in row_names}
     for rn in row_names:
         for m in methods:
             cm, csd = mean_sd(cov_runs[rn][m])
+            gm, gsd = mean_sd(gap_runs[rn][m])
             sm, ssd = mean_sd(sc_runs[rn][m])
             cov_stats[rn][m] = {"mean": cm, "sd": csd, "delta": cm - target_line}
+            gap_stats[rn][m] = {"mean": gm, "sd": gsd}
             sc_stats[rn][m] = {"mean": sm, "sd": ssd}
 
-    # Build formatted strings + dagger/bold
-    def fmt_cov(cm: float, csd: float, delta: float, *, dagger: bool) -> str:
-        if not np.isfinite(cm):
-            return "--"
-        # Display Panel A in percent units.
-        s = 100.0
-        d = delta
-        core = f"{(s * cm):.{digits_cov}f} ({(s * d):+.{digits_cov}f}) ± {(s * csd):.{digits_cov}f}"
-        return core + (r"$^{\dagger}$" if dagger else "")
+    # Build formatted strings + dagger/bold/underline
+    def fmt_cov(cm: float, csd: float, delta: float, gm: float, gsd: float, *, dagger: bool, bold: bool, underline: bool) -> str:
+        if panel_a_mode_use == "coverage_gap":
+            if not np.isfinite(gm):
+                return "--"
+            s = 100.0
+            core = f"{(s * gm):.{digits_cov}f} ± {(s * gsd):.{digits_cov}f}"
+        else:
+            if not np.isfinite(cm):
+                return "--"
+            s = 100.0
+            d = delta
+            core = f"{(s * cm):.{digits_cov}f} ({(s * d):+.{digits_cov}f}) ± {(s * csd):.{digits_cov}f}"
+        core = core + (r"$^{\dagger}$" if dagger else "")
+        if bold:
+            return r"\textbf{" + core + "}"
+        if underline:
+            return r"\underline{" + core + "}"
+        return core
 
     def fmt_sc(sm: float, ssd: float, *, bold: bool, underline: bool) -> str:
         if not np.isfinite(sm):
@@ -2458,11 +2506,31 @@ def build_methods_macro_table_from_artifacts(
             cm = cov_stats[rn][m]["mean"]
             csd = cov_stats[rn][m]["sd"]
             delta = cov_stats[rn][m]["delta"]
+            gm = gap_stats[rn][m]["mean"]
+            gsd = gap_stats[rn][m]["sd"]
             dagger = bool(np.isfinite(cm) and np.isfinite(target_line) and (cm < target_line - float(coverage_tol)))
             undercovers[rn][m] = dagger
-            panelA[rn][m] = fmt_cov(cm, csd, delta, dagger=dagger)
 
-        # Mark best/second-best (lowest) interval score among methods that are NOT dagger
+        # Panel A: best/second-best = smallest/second-smallest gap among non-dagger methods
+        eligible_a = [m for m in methods if not undercovers[rn][m] and np.isfinite(gap_stats[rn][m]["mean"])]
+        best_a = None
+        second_a = None
+        if len(eligible_a) >= 1:
+            eligible_a_sorted = sorted(eligible_a, key=lambda mm: gap_stats[rn][mm]["mean"])
+            best_a = eligible_a_sorted[0]
+            if len(eligible_a_sorted) >= 2:
+                second_a = eligible_a_sorted[1]
+
+        for m in methods:
+            cm = cov_stats[rn][m]["mean"]
+            csd = cov_stats[rn][m]["sd"]
+            delta = cov_stats[rn][m]["delta"]
+            gm = gap_stats[rn][m]["mean"]
+            gsd = gap_stats[rn][m]["sd"]
+            dagger = undercovers[rn][m]
+            panelA[rn][m] = fmt_cov(cm, csd, delta, gm, gsd, dagger=dagger, bold=(best_a == m), underline=(second_a == m))
+
+        # Panel B: best/second-best (lowest) interval score among methods that are NOT dagger
         eligible = [m for m in methods if not undercovers[rn][m] and np.isfinite(sc_stats[rn][m]["mean"])]
         best_m = None
         second_m = None
@@ -2479,12 +2547,23 @@ def build_methods_macro_table_from_artifacts(
     # Optional LaTeX (two panels)
     latex_str = None
     if latex:
-        cap = latex_caption or (
-            "Coverage and interval score across conditioning partitions. "
-            "Values are macro-averaged over groups within each partition and reported as mean$\\pm$sd over runs. "
-            "In Panel A, $\\Delta$ denotes coverage minus target $(1-\\alpha)$. "
-            "In Panel B, lower is better; bold indicates the best (lowest) score among methods that satisfy coverage (no dagger)."
-        )
+        if panel_a_mode_use == "coverage_gap":
+            cap_a = r"\textbf{Panel A: Coverage gap}"
+            cap_text = (
+                "Coverage gap and interval score across conditioning partitions. "
+                "Values are macro-averaged over groups within each partition and reported as mean$\\pm$sd over runs. "
+                "In Panel A, coverage gap $=|$empirical coverage $-$ target$|$ (in \\%); bold/underline = best/second-best (smallest gap) among methods that satisfy coverage (no dagger). "
+                "In Panel B, lower is better; bold/underline = best/second-best (lowest) interval score among methods that satisfy coverage."
+            )
+        else:
+            cap_a = r"\textbf{Panel A: Coverage}"
+            cap_text = (
+                "Coverage and interval score across conditioning partitions. "
+                "Values are macro-averaged over groups within each partition and reported as mean$\\pm$sd over runs. "
+                "In Panel A, $\\Delta$ denotes coverage minus target $(1-\\alpha)$; bold/underline = best/second-best (smallest $|\\Delta|$) among methods that satisfy coverage (no dagger). "
+                "In Panel B, lower is better; bold/underline = best/second-best (lowest) interval score among methods that satisfy coverage."
+            )
+        cap = latex_caption or cap_text
         cols = "l" + "c" * len(methods)
         header = "Condition & " + " & ".join(labels) + r" \\"
 
@@ -2503,7 +2582,7 @@ def build_methods_macro_table_from_artifacts(
             r"\small" "\n"
             r"\setlength{\tabcolsep}{6pt}" "\n"
             r"\begin{minipage}{\textwidth}" "\n"
-            r"\subcaption*{\textbf{Panel A: Coverage}}" "\n"
+            rf"\subcaption*{{{cap_a}}}" "\n"
             rf"\begin{{tabular}}{{{cols}}}" "\n"
             r"\toprule" "\n"
             + header + "\n"
@@ -2536,9 +2615,11 @@ def build_methods_macro_table_from_artifacts(
         "target": target_line,
         "coverage_tol": float(coverage_tol),
         "min_group_size": int(min_group_size),
+        "panel_a_mode": panel_a_mode_use,
         "panelA": panelA,
         "panelB": panelB,
         "coverage_stats": cov_stats,
+        "gap_stats": gap_stats,
         "score_stats": sc_stats,
         "latex": latex_str,
     }
