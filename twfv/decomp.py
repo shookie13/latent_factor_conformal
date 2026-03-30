@@ -109,6 +109,14 @@ class HierarchicalRowScore:
     f_post: np.ndarray
     eps_hat_obs: np.ndarray
 
+@dataclass
+class ExactRegionScore:
+    total: float
+    latent: float
+    idio: float
+    r: np.ndarray
+    f_post_full: np.ndarray
+    eps_hat_full: np.ndarray
 
 class HierarchicalFactorSplitCP:
     """
@@ -517,6 +525,458 @@ class HierarchicalFactorSplitCP:
             }
         return out
 
+    # ---------------------------
+    # New exact-region utilities
+    # ---------------------------
+
+    def _row_full_region_mats(
+        self,
+        i: int,
+        t: int,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Build the exact-region matrices for a single row (i,t), assuming the
+        candidate row is fully specified (with some coordinates possibly fixed).
+
+        Model:
+            r = y - mu
+            f_hat(r) = A L^T Sigma^{-1} r
+            eps_hat(r) = r - L f_hat(r) = D Sigma^{-1} r
+
+        Then
+            S_lat(r)^2 = r^T B r
+            S_idio(r)  = || C r ||_inf
+
+        where
+            Sigma = L A L^T + D
+            B     = Sigma^{-1} L A L^T Sigma^{-1}
+            C     = D^{1/2} Sigma^{-1}
+        """
+        self._check_ready()
+
+        J, r = self.L.shape
+
+        A = self._row_prior_cov(i, t)          # (r, r)
+        d_diag = self._row_idio_diag(i)        # (J,)
+        D = np.diag(d_diag)                    # (J, J)
+
+        Ij = np.eye(J)
+
+        LA = self.L @ A                        # (J, r)
+        Sigma = LA @ self.L.T + D
+        Sigma = 0.5 * (Sigma + Sigma.T) + self.jitter * Ij
+        Sigma_inv = np.linalg.inv(Sigma)
+
+        K = LA @ self.L.T                      # = L A L^T
+        B = Sigma_inv @ K @ Sigma_inv
+        B = 0.5 * (B + B.T)
+
+        D_half = np.diag(np.sqrt(np.clip(d_diag, a_min=self.eps, a_max=None)))
+        C = D_half @ Sigma_inv
+
+        return {
+            "A": A,
+            "D": D,
+            "d_diag": d_diag,
+            "Sigma": Sigma,
+            "Sigma_inv": Sigma_inv,
+            "B": B,
+            "C": C,
+        }
+
+    def exact_region_score_row(
+        self,
+        i: int,
+        t: int,
+        y_row: np.ndarray,
+        mu_row: np.ndarray,
+        observed_y: Optional[np.ndarray] = None,
+        observed_mask: Optional[np.ndarray] = None,
+        enforce_observed_match: bool = True,
+        atol: float = 1e-8,
+    ) -> ExactRegionScore:
+        """
+        Evaluate the *exact* hierarchical score for a fully specified candidate row.
+
+        Parameters
+        ----------
+        i, t:
+            Row index.
+        y_row:
+            Candidate full row, shape (J,).
+        mu_row:
+            Mean row, shape (J,).
+        observed_y, observed_mask:
+            Optional already-observed coordinates. If provided and
+            enforce_observed_match=True, y_row must match them on observed coords.
+        """
+        self._check_ready()
+
+        y_row = np.asarray(y_row, dtype=float).reshape(-1)
+        mu_row = np.asarray(mu_row, dtype=float).reshape(-1)
+
+        if observed_y is not None and observed_mask is not None and enforce_observed_match:
+            observed_y = np.asarray(observed_y, dtype=float).reshape(-1)
+            observed_mask = np.asarray(observed_mask, dtype=bool).reshape(-1)
+            obs_idx = np.nonzero(observed_mask)[0]
+            if obs_idx.size > 0:
+                diff = np.abs(y_row[obs_idx] - observed_y[obs_idx])
+                if np.any(diff > atol):
+                    raise ValueError("y_row does not match observed_y on observed coordinates.")
+
+        mats = self._row_full_region_mats(i=i, t=t)
+        A = mats["A"]
+        Sigma_inv = mats["Sigma_inv"]
+        B = mats["B"]
+        C = mats["C"]
+
+        r = y_row - mu_row
+
+        f_post_full = A @ self.L.T @ Sigma_inv @ r
+        eps_hat_full = r - self.L @ f_post_full
+
+        latent_score_sq = max(r @ (B @ r), 0.0)
+        latent_score = np.sqrt(latent_score_sq)
+
+        idio_vec = C @ r
+        idio_score = np.max(np.abs(idio_vec))
+
+        total = max(latent_score, idio_score)
+
+        return ExactRegionScore(
+            total=float(total),
+            latent=float(latent_score),
+            idio=float(idio_score),
+            r=r,
+            f_post_full=f_post_full,
+            eps_hat_full=eps_hat_full,
+        )
+
+    def in_exact_region_row(
+        self,
+        i: int,
+        t: int,
+        y_row: np.ndarray,
+        mu_row: np.ndarray,
+        qhat: Optional[float] = None,
+        observed_y: Optional[np.ndarray] = None,
+        observed_mask: Optional[np.ndarray] = None,
+        atol: float = 1e-8,
+    ) -> bool:
+        """
+        Check whether a candidate full row belongs to the exact score-threshold region.
+        """
+        if qhat is None:
+            if self.qhat is None:
+                raise RuntimeError("No qhat stored. Call calibrate(...) or pass qhat explicitly.")
+            q = float(self.qhat)
+        else:
+            q = float(qhat)
+
+        s = self.exact_region_score_row(
+            i=i,
+            t=t,
+            y_row=y_row,
+            mu_row=mu_row,
+            observed_y=observed_y,
+            observed_mask=observed_mask,
+            enforce_observed_match=True,
+            atol=atol,
+        )
+        return bool(s.total <= q + atol)
+
+    # -------------------------------------------------------------
+    # CVXPY exact region + coordinate projection
+    # -------------------------------------------------------------
+
+    def _build_exact_region_cvxpy_problem(
+        self,
+        i: int,
+        t: int,
+        mu_row: np.ndarray,
+        qhat: Optional[float] = None,
+        observed_y: Optional[np.ndarray] = None,
+        observed_mask: Optional[np.ndarray] = None,
+        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    ):
+        """
+        Build a CVXPY feasibility description of the exact conformal region:
+
+            { y :
+                (y-mu)^T B (y-mu) <= q^2,
+                |C (y-mu)| <= q,
+                y_obs fixed on observed coordinates
+            }
+
+        Returns
+        -------
+        y_var : cp.Variable shape (J,)
+        constraints : list
+        meta : dict with indices and matrices
+        """
+        try:
+            import cvxpy as cp
+        except ImportError as e:
+            raise ImportError(
+                "This exact-region projection code requires cvxpy. "
+                "Install it with `pip install cvxpy`."
+            ) from e
+
+        self._check_ready()
+
+        if qhat is None:
+            if self.qhat is None:
+                raise RuntimeError("No qhat stored. Call calibrate(...) or pass qhat explicitly.")
+            q = float(self.qhat)
+        else:
+            q = float(qhat)
+
+        mu_np = np.asarray(mu_row, dtype=float).reshape(-1)
+        J = mu_np.size
+
+        mats = self._row_full_region_mats(i=i, t=t)
+        B = mats["B"]
+        C = mats["C"]
+
+        B = 0.5 * (B + B.T)
+
+        y_var = cp.Variable(J)
+        r_expr = y_var - mu_np
+
+        constraints = [
+            cp.quad_form(r_expr, B) <= q ** 2,
+            C @ r_expr <= q,
+            -(C @ r_expr) <= q,
+        ]
+
+        obs_idx = np.array([], dtype=int)
+        tgt_idx = np.arange(J, dtype=int)
+
+        if observed_y is not None and observed_mask is not None:
+            observed_y = np.asarray(observed_y, dtype=float).reshape(-1)
+            observed_mask = np.asarray(observed_mask, dtype=bool).reshape(-1)
+
+            obs_idx = np.nonzero(observed_mask)[0].astype(int)
+            tgt_idx = np.nonzero(~observed_mask)[0].astype(int)
+
+            if obs_idx.size > 0:
+                constraints.append(y_var[obs_idx] == observed_y[obs_idx])
+
+        if extra_bounds is not None:
+            lo, hi = extra_bounds
+            if lo is not None:
+                constraints.append(y_var >= np.asarray(lo, dtype=float).reshape(-1))
+            if hi is not None:
+                constraints.append(y_var <= np.asarray(hi, dtype=float).reshape(-1))
+
+        meta = {
+            "q": q,
+            "mu": mu_np,
+            "B": B,
+            "C": C,
+            "obs_idx": obs_idx,
+            "tgt_idx": tgt_idx,
+        }
+        return y_var, constraints, meta
+
+    def exact_project_channel_interval_row(
+        self,
+        i: int,
+        t: int,
+        j: int,
+        mu_row: np.ndarray,
+        qhat: Optional[float] = None,
+        observed_y: Optional[np.ndarray] = None,
+        observed_mask: Optional[np.ndarray] = None,
+        solver: Optional[str] = None,
+        solver_opts: Optional[Dict[str, Any]] = None,
+        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        atol: float = 1e-7,
+    ) -> Tuple[float, float, Dict[str, Any]]:
+        """
+        Compute the exact coordinate projection interval for channel j:
+
+            [ min y_j : y in exact region,   max y_j : y in exact region ]
+
+        If channel j is already observed and observed_mask is provided, this returns the
+        degenerate interval [observed_y[j], observed_y[j]].
+        """
+        try:
+            import cvxpy as cp
+        except ImportError as e:
+            raise ImportError(
+                "This exact-region projection code requires cvxpy. "
+                "Install it with `pip install cvxpy`."
+            ) from e
+
+        self._check_ready()
+
+        if solver is None:
+            solver = "SCS"
+        if solver_opts is None:
+            solver_opts = {"verbose": False}
+
+        mu_row = np.asarray(mu_row, dtype=float).reshape(-1)
+        J = mu_row.size
+        if not (0 <= j < J):
+            raise IndexError(f"j={j} out of bounds for J={J}")
+
+        if observed_y is not None and observed_mask is not None:
+            observed_mask_arr = np.asarray(observed_mask, dtype=bool).reshape(-1)
+            if observed_mask_arr[j]:
+                obs_val = float(np.asarray(observed_y, dtype=float).reshape(-1)[j])
+                return obs_val, obs_val, {
+                    "status_min": "fixed_observed",
+                    "status_max": "fixed_observed",
+                    "is_observed": True,
+                }
+
+        y_var, constraints, meta = self._build_exact_region_cvxpy_problem(
+            i=i,
+            t=t,
+            mu_row=mu_row,
+            qhat=qhat,
+            observed_y=observed_y,
+            observed_mask=observed_mask,
+            extra_bounds=extra_bounds,
+        )
+
+        prob_min = cp.Problem(cp.Minimize(y_var[j]), constraints)
+        prob_max = cp.Problem(cp.Maximize(y_var[j]), constraints)
+
+        prob_min.solve(solver=solver, **solver_opts)
+        status_min = prob_min.status
+        if status_min not in ("optimal", "optimal_inaccurate"):
+            raise RuntimeError(f"Minimization for channel {j} failed with status={status_min}")
+
+        lo = float(y_var.value[j])
+
+        prob_max.solve(solver=solver, **solver_opts)
+        status_max = prob_max.status
+        if status_max not in ("optimal", "optimal_inaccurate"):
+            raise RuntimeError(f"Maximization for channel {j} failed with status={status_max}")
+
+        hi = float(y_var.value[j])
+
+        if hi < lo and hi >= lo - atol:
+            hi = lo
+
+        return lo, hi, {
+            "status_min": status_min,
+            "status_max": status_max,
+            "is_observed": False,
+            "q": meta["q"],
+        }
+
+    def exact_project_intervals_row(
+        self,
+        i: int,
+        t: int,
+        mu_row: np.ndarray,
+        qhat: Optional[float] = None,
+        observed_y: Optional[np.ndarray] = None,
+        observed_mask: Optional[np.ndarray] = None,
+        target_idx: Optional[Sequence[int]] = None,
+        solver: Optional[str] = None,
+        solver_opts: Optional[Dict[str, Any]] = None,
+        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        fill_observed: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Compute exact coordinate-projection intervals for a whole row.
+
+        Parameters
+        ----------
+        target_idx:
+            Optional subset of channels to project. If None:
+              - if observed_mask is given, project the unobserved channels;
+              - otherwise, project all channels.
+        fill_observed:
+            If True and observed channels exist, fill them as degenerate intervals
+            at the observed values in the returned lower/upper arrays.
+        """
+        self._check_ready()
+
+        mu_row = np.asarray(mu_row, dtype=float).reshape(-1)
+        J = mu_row.size
+
+        if target_idx is None:
+            if observed_mask is None:
+                target_idx_list = list(range(J))
+            else:
+                observed_mask_arr = np.asarray(observed_mask, dtype=bool).reshape(-1)
+                target_idx_list = [j for j in range(J) if not observed_mask_arr[j]]
+        else:
+            target_idx_list = [int(j) for j in target_idx]
+
+        lower = np.full(J, np.nan)
+        upper = np.full(J, np.nan)
+        per_channel: Dict[int, Dict[str, Any]] = {}
+
+        if fill_observed and observed_y is not None and observed_mask is not None:
+            observed_y_arr = np.asarray(observed_y, dtype=float).reshape(-1)
+            observed_mask_arr = np.asarray(observed_mask, dtype=bool).reshape(-1)
+            obs_idx = np.nonzero(observed_mask_arr)[0]
+            if obs_idx.size > 0:
+                lower[obs_idx] = observed_y_arr[obs_idx]
+                upper[obs_idx] = observed_y_arr[obs_idx]
+
+        for j in target_idx_list:
+            lo, hi, info = self.exact_project_channel_interval_row(
+                i=i,
+                t=t,
+                j=j,
+                mu_row=mu_row,
+                qhat=qhat,
+                observed_y=observed_y,
+                observed_mask=observed_mask,
+                solver=solver,
+                solver_opts=solver_opts,
+                extra_bounds=extra_bounds,
+            )
+            lower[j] = lo
+            upper[j] = hi
+            per_channel[j] = info
+
+        aux = {
+            "target_idx": target_idx_list,
+            "per_channel": per_channel,
+        }
+        return lower, upper, aux
+
+    def predict_exact_projected_row(
+        self,
+        i: int,
+        t: int,
+        mu_row: np.ndarray,
+        qhat: Optional[float] = None,
+        observed_y: Optional[np.ndarray] = None,
+        observed_mask: Optional[np.ndarray] = None,
+        target_idx: Optional[Sequence[int]] = None,
+        solver: Optional[str] = None,
+        solver_opts: Optional[Dict[str, Any]] = None,
+        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        fill_observed: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Convenience wrapper: exact coordinate projections of the exact conformal region.
+
+        This is the direct replacement for the old conservative `predict_box_row`.
+        """
+        lower, upper, aux = self.exact_project_intervals_row(
+            i=i,
+            t=t,
+            mu_row=mu_row,
+            qhat=qhat,
+            observed_y=observed_y,
+            observed_mask=observed_mask,
+            target_idx=target_idx,
+            solver=solver,
+            solver_opts=solver_opts,
+            extra_bounds=extra_bounds,
+            fill_observed=fill_observed,
+        )
+        return lower, upper, aux
 
 # ---------------------------------------------------------------------
 # Example usage in your current pipeline
