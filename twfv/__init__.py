@@ -35,6 +35,7 @@ from .metrics import binned_interval_stats_by_quantiles, conditional_interval_re
 from .plot import plot_intervals_on_series_from_q_sigma
 from .plot import plot_compare_conditional_reports
 from .diagnostics import cal_test_scaled_residual_diagnostics, resample_test_idx_and_collect_scaled_cp_artifacts,plot_em_history_grid
+from .decomp import HierarchicalFactorSplitCP,unique_row_indices_from_flat_ijt
 __all__ = [
     "bspline_basis",
     "make_open_uniform_knots",
@@ -73,5 +74,7 @@ __all__ = [
     "cal_test_scaled_residual_diagnostics",
     "resample_test_idx_and_collect_scaled_cp_artifacts",
     "plot_em_history_grid",
+    "HierarchicalFactorSplitCP",
+    "unique_row_indices_from_flat_ijt",
 ]
 

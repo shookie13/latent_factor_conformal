@@ -10,7 +10,7 @@ This module is intentionally light-weight: it provides summaries that help answe
 from __future__ import annotations
 from scipy.stats import ks_2samp
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Sequence, Tuple
 
 import numpy as np
 import scipy
@@ -256,6 +256,67 @@ def conformal_scaled_abs(
     return lower, upper, float(q)
 
 
+def _normalize_resample_methods(methods: Optional[Sequence[str]]) -> List[str]:
+    if methods is None:
+        methods = ("tmfv", "oracle", "avg")
+
+    supported = {"scp", "tmfv", "oracle", "avg", "lcp", "cptdr", "cqr", "decomp"}
+    out: List[str] = []
+    seen = set()
+    for method in methods:
+        name = str(method).strip().lower()
+        if name not in supported:
+            raise ValueError(
+                f"Unsupported method '{method}'. Supported methods are: {sorted(supported)}."
+            )
+        if name not in seen:
+            out.append(name)
+            seen.add(name)
+    return out
+
+
+def _collect_interval_artifact(
+    *,
+    art: Dict[str, Any],
+    method: str,
+    y_true: np.ndarray,
+    y_hat: np.ndarray,
+    x: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    n_bins: int,
+    q: Optional[float] = None,
+    sigma_test: Optional[np.ndarray] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    lower = np.asarray(lower, dtype=float)
+    upper = np.asarray(upper, dtype=float)
+    covered = (y_true >= lower) & (y_true <= upper)
+    report = conditional_interval_report(
+        y_true=y_true,
+        lower=lower,
+        upper=upper,
+        x=x,
+        y_hat=y_hat,
+        n_bins=int(n_bins),
+    )
+    art.update(
+        {
+            f"lower_{method}": lower,
+            f"upper_{method}": upper,
+            f"covered_{method}": covered,
+            f"coverage_{method}": float(np.mean(covered)) if covered.size else float("nan"),
+            f"report_{method}": report,
+        }
+    )
+    if q is not None:
+        art[f"q_{method}"] = float(q)
+    if sigma_test is not None:
+        art[f"sigma_test_{method}"] = np.asarray(sigma_test, dtype=float)
+    if extra:
+        art.update(extra)
+
+
 def resample_test_idx_and_collect_scaled_cp_artifacts(
     *,
     Y: np.ndarray,  # (I,T,J)
@@ -267,17 +328,8 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
     alpha: float = 0.1,
     seed: int = 123,
     n_bins: int = 5,
-    # Optional: include LCP (Localized Split Conformal) baseline.
-    include_lcp: bool = False,
-    lcp_kwargs: Optional[Dict[str, Any]] = None,
-    # Optional: include CPTD-R (Lin et al., 2022) baseline.
-    include_cptdr: bool = False,
-    cptdr_kwargs: Optional[Dict[str, Any]] = None,
-    # Optional: include CQR (Conformalized Quantile Regression) baseline.
-    include_cqr: bool = False,
-    cqr_kwargs: Optional[Dict[str, Any]] = None,
-    cqr_random_state_base: int = 0,
-    cqr_alpha: Optional[float] = None,
+    methods: Optional[Sequence[str]] = None,
+    method_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Resample TEST points `t_res` times using `p_miss` while keeping `train_idx` fixed.
@@ -295,20 +347,22 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
         List of dicts. Each dict contains:
           - cal_idx, test_idx
           - t_test, subj_test, chan_test
-          - q_tmfv/q_oracle/q_avg, coverage_* scalars
+          - q_scp/q_tmfv/q_oracle/q_avg, coverage_* scalars
           - lower_*/upper_* arrays, covered_* arrays
           - report_* conditional reports (key "X" uses x=t_test)
-          - (optional) LCP outputs if include_lcp=True:
+          - (optional) method-specific outputs if selected via `methods`:
+              lower_scp, upper_scp, covered_scp, coverage_scp, report_scp
               lower_lcp, upper_lcp, covered_lcp, coverage_lcp, report_lcp
-          - (optional) CPTD-R outputs if include_cptdr=True:
               lower_cptdr, upper_cptdr, covered_cptdr, coverage_cptdr, report_cptdr
-          - (optional) CQR outputs if include_cqr=True:
               lower_cqr, upper_cqr, covered_cqr, coverage_cqr, report_cqr
+              lower_decomp, upper_decomp, covered_decomp, coverage_decomp, report_decomp
     """
     Y = np.asarray(Y, dtype=float)
     if Y.ndim != 3:
         raise ValueError("Y must have shape (I,T,J)")
     I, T, J = Y.shape
+    methods_use = _normalize_resample_methods(methods)
+    method_kwargs = {str(k).strip().lower(): dict(v) for k, v in (method_kwargs or {}).items()}
 
     train_idx = np.asarray(train_idx, dtype=int).ravel()
     sigma_fit_flat = np.asarray(sigma_fit_flat, dtype=float).ravel()
@@ -326,25 +380,30 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
     tt = np.tile(np.arange(1, T + 1), I * J)
     X_all = np.stack([ii, jj, tt], axis=1).astype(float)  # (I*J*T, 3)
 
-    if include_lcp:
+    if "scp" in methods_use:
+        from twfv.cp import NaiveAbsoluteResidualCP
+
+        scp_kwargs = dict(method_kwargs.get("scp", {}))
+
+    if "lcp" in methods_use:
         from twfv.cp import LocalizedSplitConformalCP
 
-        lcp_kwargs = dict(lcp_kwargs or {})
+        lcp_kwargs = dict(method_kwargs.get("lcp", {}))
 
-    if include_cptdr:
+    if "cptdr" in methods_use:
         from twfv.cp import CPTDRSplitConformalCP
 
-        cptdr_kwargs = dict(cptdr_kwargs or {})
+        cptdr_kwargs = dict(method_kwargs.get("cptdr", {}))
 
-    if include_cqr:
+    if "cqr" in methods_use:
         try:
             from scripts.cqr import ConformalQuantileRegressor  # type: ignore
         except Exception as e:  # pragma: no cover
             raise ImportError(
-                "include_cqr=True requires `scripts/cqr.py` and its dependencies "
-                "(notably scikit-learn). Install scikit-learn or set include_cqr=False."
+                "methods=['cqr', ...] requires `scripts/cqr.py` and its dependencies "
+                "(notably scikit-learn). Install scikit-learn or remove 'cqr' from methods."
             ) from e
-        cqr_kwargs = dict(cqr_kwargs or {})
+        cqr_kwargs = dict(method_kwargs.get("cqr", {}))
         # IMPORTANT: `ConformalQuantileRegressor(alpha=...)` uses alpha for CP miscoverage,
         # but sklearn.linear_model.QuantileRegressor(alpha=...) uses alpha for regularization.
         # To avoid ambiguous/buggy calls, treat cqr_kwargs["alpha"] as *regressor alpha*
@@ -355,7 +414,15 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
         # Important: do NOT read it from cqr_kwargs["alpha"], because some regressors
         # (notably sklearn.linear_model.QuantileRegressor) use `alpha` as a *regularization*
         # hyperparameter. Use `cqr_alpha=` if you need CQR to use a different miscoverage.
-        cqr_alpha_use = float(alpha if cqr_alpha is None else cqr_alpha)
+        cqr_alpha_use = float(cqr_kwargs.pop("cqr_alpha", alpha))
+        cqr_random_state_base = int(cqr_kwargs.pop("random_state_base", 0))
+
+    if "decomp" in methods_use:
+        from twfv.decomp import HierarchicalFactorSplitCP, unique_row_indices_from_flat_ijt
+
+        decomp_kwargs = dict(method_kwargs.get("decomp", {}))
+        if "em_result" not in decomp_kwargs:
+            raise ValueError("method_kwargs['decomp'] must include 'em_result'.")
 
     rng = np.random.default_rng(int(seed))
     artifacts: List[Dict[str, Any]] = []
@@ -380,46 +447,48 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
         sigma_test_oracle = sigma_oracle_flat[test_idx]
         sigma_cal_avg = 0.5 * (sigma_cal + sigma_cal_oracle)
         sigma_test_avg = 0.5 * (sigma_test + sigma_test_oracle)
-        # q95 = scipy.stats.norm.ppf(0.95)
-        # lower_oracle = -q95 * sigma_test_oracle+Y_test_fit
-        # upper_oracle =  q95 * sigma_test_oracle+Y_test_fit
-        # lower_avg = -q95 * sigma_test_avg+Y_test_fit
-        # upper_avg =  q95 * sigma_test_avg+Y_test_fit
-        # CP intervals
-        lower_tmfv, upper_tmfv, q_tmfv = conformal_scaled_abs(
-            Y_cal_true, Y_cal_fit, sigma_cal, Y_test_fit, sigma_test, alpha=alpha
-        )
-        lower_oracle, upper_oracle, q_cal_oracle = conformal_scaled_abs(
-            Y_cal_true, Y_cal_fit, sigma_cal_oracle, Y_test_fit, sigma_test_oracle, alpha=alpha
-        )
-        lower_avg, upper_avg, q_avg = conformal_scaled_abs(
-            Y_cal_true, Y_cal_fit, sigma_cal_avg, Y_test_fit, sigma_test_avg, alpha=alpha
-        )
+
+        if "scp" in methods_use:
+            scp = NaiveAbsoluteResidualCP(shape_ref=Y, J=J, alpha=float(alpha), **scp_kwargs)
+            scp.calibrate_from_fit(cal_idx, Y_cal_true, Y_cal_fit)
+            intervals_scp = scp.predict_interval_from_fit(test_idx, Y_test_fit, alpha=float(alpha))
+            lower_scp = intervals_scp[:, 0]
+            upper_scp = intervals_scp[:, 1]
+            q_scp = float(scp.q_abs) if np.isfinite(scp.q_abs) else 0.0
+
+        if "tmfv" in methods_use:
+            lower_tmfv, upper_tmfv, q_tmfv = conformal_scaled_abs(
+                Y_cal_true, Y_cal_fit, sigma_cal, Y_test_fit, sigma_test, alpha=alpha
+            )
+        else:
+            q_tmfv = float("nan")
+
+        if "oracle" in methods_use:
+            lower_oracle, upper_oracle, q_cal_oracle = conformal_scaled_abs(
+                Y_cal_true, Y_cal_fit, sigma_cal_oracle, Y_test_fit, sigma_test_oracle, alpha=alpha
+            )
+        else:
+            q_cal_oracle = float("nan")
+
+        if "avg" in methods_use:
+            lower_avg, upper_avg, q_avg = conformal_scaled_abs(
+                Y_cal_true, Y_cal_fit, sigma_cal_avg, Y_test_fit, sigma_test_avg, alpha=alpha
+            )
+        else:
+            q_avg = float("nan")
+
         S_cal_oracle = np.abs(Y_cal_true - Y_cal_fit) / sigma_cal_oracle
         S_test_oracle = np.abs(Y_test_true - Y_test_fit) / sigma_test_oracle
         delta_mean = S_test_oracle.mean() - S_cal_oracle.mean()
         q_test_oracle = _quantile_higher(S_test_oracle, alpha=float(alpha))
         delta_q = q_test_oracle - q_cal_oracle
         D, pval = ks_2samp(S_test_oracle, S_cal_oracle, alternative="two-sided", method="auto")
-        covered_tmfv = (Y_test_true >= lower_tmfv) & (Y_test_true <= upper_tmfv)
-        covered_oracle = (Y_test_true >= lower_oracle) & (Y_test_true <= upper_oracle)
-        covered_avg = (Y_test_true >= lower_avg) & (Y_test_true <= upper_avg)
 
         # ids from flatten convention
         test_idx = np.asarray(test_idx, dtype=int).ravel()
         t_test = (test_idx % T).astype(int)
         subj_test = (test_idx // (J * T)).astype(int)
         chan_test = ((test_idx // T) % J).astype(int)
-
-        report_tmfv = conditional_interval_report(
-            y_true=Y_test_true, lower=lower_tmfv, upper=upper_tmfv, x=t_test, y_hat=Y_test_fit, n_bins=int(n_bins)
-        )
-        report_oracle = conditional_interval_report(
-            y_true=Y_test_true, lower=lower_oracle, upper=upper_oracle, x=t_test, y_hat=Y_test_fit, n_bins=int(n_bins)
-        )
-        report_avg = conditional_interval_report(
-            y_true=Y_test_true, lower=lower_avg, upper=upper_avg, x=t_test, y_hat=Y_test_fit, n_bins=int(n_bins)
-        )
 
         art = dict(
                 resample_id=int(b),
@@ -441,33 +510,65 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
                 sigma_test=sigma_test,
                 sigma_test_oracle=sigma_test_oracle,
                 sigma_test_avg=sigma_test_avg,
-                # intervals & coverage
-                q_tmfv=float(q_tmfv),
-                q_oracle=float(q_cal_oracle),
-                q_avg=float(q_avg),
                 delta_mean=float(delta_mean),
                 delta_q=float(delta_q),
                 D=float(D),
                 pval=float(pval),
-                lower_tmfv=lower_tmfv,
-                upper_tmfv=upper_tmfv,
-                lower_oracle=lower_oracle,
-                upper_oracle=upper_oracle,
-                lower_avg=lower_avg,
-                upper_avg=upper_avg,
-                covered_tmfv=covered_tmfv,
-                covered_oracle=covered_oracle,
-                covered_avg=covered_avg,
-                coverage_tmfv=float(np.mean(covered_tmfv)) if covered_tmfv.size else float("nan"),
-                coverage_oracle=float(np.mean(covered_oracle)) if covered_oracle.size else float("nan"),
-                coverage_avg=float(np.mean(covered_avg)) if covered_avg.size else float("nan"),
-                # conditional reports (by time in key "X")
-                report_tmfv=report_tmfv,
-                report_oracle=report_oracle,
-                report_avg=report_avg,
         )
 
-        if include_lcp:
+        if "scp" in methods_use:
+            _collect_interval_artifact(
+                art=art,
+                method="scp",
+                y_true=Y_test_true,
+                y_hat=Y_test_fit,
+                x=t_test,
+                lower=lower_scp,
+                upper=upper_scp,
+                n_bins=n_bins,
+                q=q_scp,
+            )
+
+        if "tmfv" in methods_use:
+            _collect_interval_artifact(
+                art=art,
+                method="tmfv",
+                y_true=Y_test_true,
+                y_hat=Y_test_fit,
+                x=t_test,
+                lower=lower_tmfv,
+                upper=upper_tmfv,
+                n_bins=n_bins,
+                q=q_tmfv,
+            )
+
+        if "oracle" in methods_use:
+            _collect_interval_artifact(
+                art=art,
+                method="oracle",
+                y_true=Y_test_true,
+                y_hat=Y_test_fit,
+                x=t_test,
+                lower=lower_oracle,
+                upper=upper_oracle,
+                n_bins=n_bins,
+                q=q_cal_oracle,
+            )
+
+        if "avg" in methods_use:
+            _collect_interval_artifact(
+                art=art,
+                method="avg",
+                y_true=Y_test_true,
+                y_hat=Y_test_fit,
+                x=t_test,
+                lower=lower_avg,
+                upper=upper_avg,
+                n_bins=n_bins,
+                q=q_avg,
+            )
+
+        if "lcp" in methods_use:
             # LCP uses only indices (to recover time via unflatten) plus (y_true, y_fit).
             # Here y_fit is 0 (innovations), consistent with this function's conventions.
             lcp = LocalizedSplitConformalCP(shape_ref=Y, J=J, alpha=float(alpha), **lcp_kwargs)
@@ -483,21 +584,18 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
             )
             lower_lcp = intervals_lcp[:, 0]
             upper_lcp = intervals_lcp[:, 1]
-            covered_lcp = (Y_test_true >= lower_lcp) & (Y_test_true <= upper_lcp)
-            report_lcp = conditional_interval_report(
-                y_true=Y_test_true, lower=lower_lcp, upper=upper_lcp, x=t_test, y_hat=Y_test_fit, n_bins=int(n_bins)
-            )
-            art.update(
-                dict(
-                    lower_lcp=lower_lcp,
-                    upper_lcp=upper_lcp,
-                    covered_lcp=covered_lcp,
-                    coverage_lcp=float(np.mean(covered_lcp)) if covered_lcp.size else float("nan"),
-                    report_lcp=report_lcp,
-                )
+            _collect_interval_artifact(
+                art=art,
+                method="lcp",
+                y_true=Y_test_true,
+                y_hat=Y_test_fit,
+                x=t_test,
+                lower=lower_lcp,
+                upper=upper_lcp,
+                n_bins=n_bins,
             )
 
-        if include_cptdr:
+        if "cptdr" in methods_use:
             # CPTD-R uses temporally- and cross-sectionally-informed normalization.
             # We supply `train_idx` as additional "history" points to build residual histories,
             # but only CAL points are used for conformal quantile calibration.
@@ -517,26 +615,18 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
             )
             lower_cptdr = intervals_cptdr[:, 0]
             upper_cptdr = intervals_cptdr[:, 1]
-            covered_cptdr = (Y_test_true >= lower_cptdr) & (Y_test_true <= upper_cptdr)
-            report_cptdr = conditional_interval_report(
+            _collect_interval_artifact(
+                art=art,
+                method="cptdr",
                 y_true=Y_test_true,
+                y_hat=Y_test_fit,
+                x=t_test,
                 lower=lower_cptdr,
                 upper=upper_cptdr,
-                x=t_test,
-                y_hat=Y_test_fit,
-                n_bins=int(n_bins),
-            )
-            art.update(
-                dict(
-                    lower_cptdr=lower_cptdr,
-                    upper_cptdr=upper_cptdr,
-                    covered_cptdr=covered_cptdr,
-                    coverage_cptdr=float(np.mean(covered_cptdr)) if covered_cptdr.size else float("nan"),
-                    report_cptdr=report_cptdr,
-                )
+                n_bins=n_bins,
             )
 
-        if include_cqr:
+        if "cqr" in methods_use:
             # CQR uses (X_train, y_train) for training and (X_calib, y_calib) for conformal calibration.
             X_calib = X_all[cal_idx]
             y_calib = Y_cal_true  # same values
@@ -548,20 +638,96 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
             cqr = ConformalQuantileRegressor(alpha=cqr_alpha_use, random_state=rs, **cqr_kwargs)
             cqr.fit(X_train, y_train, X_calib, y_calib)
             lower_cqr, upper_cqr = cqr.predict_interval(X_test)
-            covered_cqr = (y_test >= lower_cqr) & (y_test <= upper_cqr)
-            report_cqr = conditional_interval_report(
-                y_true=y_test, lower=lower_cqr, upper=upper_cqr, x=t_test, y_hat=Y_test_fit, n_bins=int(n_bins)
+            _collect_interval_artifact(
+                art=art,
+                method="cqr",
+                y_true=y_test,
+                y_hat=Y_test_fit,
+                x=t_test,
+                lower=lower_cqr,
+                upper=upper_cqr,
+                n_bins=n_bins,
+                extra={
+                    "cqr_alpha": float(cqr_alpha_use),
+                    "cqr_random_state": int(rs),
+                },
             )
-            art.update(
-                dict(
-                    lower_cqr=lower_cqr,
-                    upper_cqr=upper_cqr,
-                    covered_cqr=covered_cqr,
-                    coverage_cqr=float(np.mean(covered_cqr)) if covered_cqr.size else float("nan"),
-                    report_cqr=report_cqr,
-                    cqr_alpha=float(cqr_alpha_use),
-                    cqr_random_state=int(rs),
+
+        if "decomp" in methods_use:
+            decomp_cfg = dict(decomp_kwargs)
+            em_result = decomp_cfg.pop("em_result")
+            decomp_alpha = float(decomp_cfg.pop("alpha", alpha))
+            mu_full = np.asarray(decomp_cfg.pop("mu_full", np.zeros_like(Y)), dtype=float)
+            degenerate_observed = bool(decomp_cfg.pop("degenerate_observed", True))
+            row_weights = decomp_cfg.pop("row_weights", None)
+
+            hfcp = HierarchicalFactorSplitCP.from_run_em_like(
+                em_result,
+                alpha=decomp_alpha,
+                **decomp_cfg,
+            )
+            cal_rows = unique_row_indices_from_flat_ijt(cal_idx, J=J, T=T)
+            flat_cal_mask = np.zeros(I * J * T, dtype=bool)
+            flat_cal_mask[np.asarray(cal_idx, dtype=int).ravel()] = True
+            M_cal = flat_cal_mask.reshape(I, J, T).transpose(0, 2, 1)
+            q_decomp = hfcp.calibrate(
+                Y_cal=Y,
+                M_cal=M_cal,
+                row_indices=cal_rows,
+                mu_cal=mu_full,
+                row_weights=row_weights,
+            )
+
+            flat_test_mask = np.zeros(I * J * T, dtype=bool)
+            flat_test_mask[test_idx] = True
+            M_test = flat_test_mask.reshape(I, J, T).transpose(0, 2, 1)
+
+            lower_decomp = np.full(test_idx.shape[0], np.nan, dtype=float)
+            upper_decomp = np.full(test_idx.shape[0], np.nan, dtype=float)
+            row_aux: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+            row_to_positions: Dict[Tuple[int, int], List[int]] = {}
+            for pos, k in enumerate(test_idx.tolist()):
+                i = int(k // (J * T))
+                rem = int(k % (J * T))
+                j = int(rem // T)
+                t = int(rem % T)
+                row_to_positions.setdefault((i, t), []).append(pos)
+                row_aux.setdefault((i, t), {"channels": []})
+                row_aux[(i, t)]["channels"].append(j)
+
+            for (i, t), positions in row_to_positions.items():
+                observed_mask = ~M_test[i, t]
+                observed_y = Y[i, t, :]
+                lower_row, upper_row, aux_row = hfcp.predict_box_row(
+                    i=i,
+                    t=t,
+                    mu_row=mu_full[i, t],
+                    qhat=q_decomp,
+                    observed_y=observed_y,
+                    observed_mask=observed_mask,
+                    degenerate_observed=degenerate_observed,
                 )
+                for pos in positions:
+                    chan = int(chan_test[pos])
+                    lower_decomp[pos] = float(lower_row[chan])
+                    upper_decomp[pos] = float(upper_row[chan])
+                row_aux[(i, t)].update(aux_row=aux_row)
+
+            _collect_interval_artifact(
+                art=art,
+                method="decomp",
+                y_true=Y_test_true,
+                y_hat=Y_test_fit,
+                x=t_test,
+                lower=lower_decomp,
+                upper=upper_decomp,
+                n_bins=n_bins,
+                q=q_decomp,
+                extra={
+                    "decomp_cal_rows": cal_rows,
+                    "decomp_aux_by_row": row_aux,
+                },
             )
 
         artifacts.append(art)

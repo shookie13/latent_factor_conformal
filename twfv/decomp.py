@@ -3,55 +3,67 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 
 
-def higher_quantile(scores: torch.Tensor, alpha: float) -> torch.Tensor:
+def _as_numpy_array(x: Any, dtype: Optional[np.dtype] = None) -> np.ndarray:
+    if isinstance(x, np.ndarray):
+        arr = x
+    elif hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
+        arr = x.detach().cpu().numpy()
+    else:
+        arr = np.asarray(x)
+
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    return arr
+
+
+def higher_quantile(scores: np.ndarray, alpha: float) -> float:
     """
     Split-conformal 'higher' quantile:
         q = sorted_scores[ ceil((n+1)*(1-alpha)) - 1 ]
     """
-    scores = scores.reshape(-1)
-    if scores.numel() == 0:
+    scores = _as_numpy_array(scores).reshape(-1)
+    if scores.size == 0:
         raise ValueError("No scores provided.")
-    scores_sorted = torch.sort(scores).values
-    n = scores_sorted.numel()
+    scores_sorted = np.sort(scores)
+    n = scores_sorted.size
     k = int(math.ceil((n + 1) * (1.0 - alpha)))
     k = min(max(k, 1), n)
-    return scores_sorted[k - 1]
+    return float(scores_sorted[k - 1])
 
 
 def weighted_higher_quantile(
-    scores: torch.Tensor,
-    weights: torch.Tensor,
+    scores: np.ndarray,
+    weights: np.ndarray,
     alpha: float,
     eps: float = 1e-12,
-) -> torch.Tensor:
+) -> float:
     """
     Weighted empirical quantile with 'higher'-style behavior:
     smallest score whose cumulative normalized weight >= 1 - alpha.
 
     This is useful if you later want latent-space localization weights.
     """
-    scores = scores.reshape(-1)
-    weights = weights.reshape(-1)
-    if scores.numel() == 0:
+    scores = _as_numpy_array(scores).reshape(-1)
+    weights = _as_numpy_array(weights).reshape(-1)
+    if scores.size == 0:
         raise ValueError("No scores provided.")
-    if scores.numel() != weights.numel():
+    if scores.size != weights.size:
         raise ValueError("scores and weights must have the same length.")
 
-    weights = torch.clamp(weights, min=0.0)
+    weights = np.clip(weights, 0.0, None)
     wsum = weights.sum()
     if wsum <= eps:
         return higher_quantile(scores, alpha)
 
-    order = torch.argsort(scores)
+    order = np.argsort(scores)
     s = scores[order]
     w = weights[order] / wsum
-    cdf = torch.cumsum(w, dim=0)
-    idx = torch.searchsorted(cdf, torch.tensor(1.0 - alpha, device=cdf.device, dtype=cdf.dtype))
-    idx = min(int(idx.item()), s.numel() - 1)
-    return s[idx]
+    cdf = np.cumsum(w)
+    idx = np.searchsorted(cdf, 1.0 - alpha, side="left")
+    idx = min(int(idx), s.size - 1)
+    return float(s[idx])
 
 
 def unique_row_indices_from_flat_ijt(flat_idx: np.ndarray, J: int, T: int) -> List[Tuple[int, int]]:
@@ -75,7 +87,7 @@ def unique_row_indices_from_flat_ijt(flat_idx: np.ndarray, J: int, T: int) -> Li
     return [(int(ii), int(tt)) for ii, tt in rows]
 
 
-def all_nonempty_row_indices(M_mask: torch.Tensor) -> List[Tuple[int, int]]:
+def all_nonempty_row_indices(M_mask: np.ndarray) -> List[Tuple[int, int]]:
     """
     Return all (i,t) rows with at least one observed channel.
     """
@@ -83,7 +95,7 @@ def all_nonempty_row_indices(M_mask: torch.Tensor) -> List[Tuple[int, int]]:
     out: List[Tuple[int, int]] = []
     for i in range(I):
         for t in range(T):
-            if bool(M_mask[i, t].any()):
+            if bool(np.any(M_mask[i, t])):
                 out.append((i, t))
     return out
 
@@ -94,8 +106,8 @@ class HierarchicalRowScore:
     latent: float
     idio: float
     num_obs: int
-    f_post: torch.Tensor
-    eps_hat_obs: torch.Tensor
+    f_post: np.ndarray
+    eps_hat_obs: np.ndarray
 
 
 class HierarchicalFactorSplitCP:
@@ -126,13 +138,13 @@ class HierarchicalFactorSplitCP:
         self.jitter = float(jitter)
         self.eps = float(eps)
 
-        self.L: Optional[torch.Tensor] = None
-        self.a2: Optional[torch.Tensor] = None
-        self.psi: Optional[torch.Tensor] = None
-        self.s: Optional[torch.Tensor] = None
+        self.L: Optional[np.ndarray] = None
+        self.a2: Optional[np.ndarray] = None
+        self.psi: Optional[np.ndarray] = None
+        self.s: Optional[np.ndarray] = None
 
-        self.qhat: Optional[torch.Tensor] = None
-        self.cal_scores_: Optional[torch.Tensor] = None
+        self.qhat: Optional[float] = None
+        self.cal_scores_: Optional[np.ndarray] = None
         self.cal_rows_: Optional[List[Tuple[int, int]]] = None
 
     @classmethod
@@ -157,49 +169,45 @@ class HierarchicalFactorSplitCP:
 
     def set_factor_params(
         self,
-        L: torch.Tensor,
-        a2: torch.Tensor,
-        psi: torch.Tensor,
-        s: torch.Tensor,
+        L: np.ndarray,
+        a2: np.ndarray,
+        psi: np.ndarray,
+        s: np.ndarray,
     ) -> None:
-        self.L = L
-        self.a2 = a2
-        self.psi = psi
-        self.s = s
+        self.L = _as_numpy_array(L)
+        self.a2 = _as_numpy_array(a2, dtype=self.L.dtype)
+        self.psi = _as_numpy_array(psi, dtype=self.L.dtype)
+        self.s = _as_numpy_array(s, dtype=self.L.dtype)
 
     def _check_ready(self) -> None:
         if self.L is None or self.a2 is None or self.psi is None or self.s is None:
             raise RuntimeError("Factor parameters are not set. Call set_factor_params(...) first.")
 
-    def _device(self) -> torch.device:
-        self._check_ready()
-        return self.L.device
-
-    def _dtype(self) -> torch.dtype:
+    def _dtype(self) -> np.dtype:
         self._check_ready()
         return self.L.dtype
 
-    def _row_prior_cov(self, i: int, t: int) -> torch.Tensor:
+    def _row_prior_cov(self, i: int, t: int) -> np.ndarray:
         """
         A_it = diag(a2[i,t]) in factor space.
         """
         self._check_ready()
-        return torch.diag(torch.clamp(self.a2[i, t], min=self.eps))
+        return np.diag(np.clip(self.a2[i, t], self.eps, None))
 
-    def _row_idio_diag(self, i: int) -> torch.Tensor:
+    def _row_idio_diag(self, i: int) -> np.ndarray:
         """
         D_i = s_i^2 * diag(psi)
         """
         self._check_ready()
-        return (self.s[i] ** 2) * torch.clamp(self.psi, min=self.eps)
+        return (self.s[i] ** 2) * np.clip(self.psi, self.eps, None)
 
     def _posterior_factor_given_obs(
         self,
         i: int,
         t: int,
-        residual_obs: torch.Tensor,
-        obs_idx: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual_obs: np.ndarray,
+        obs_idx: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Gaussian posterior of latent factor f | observed residuals.
 
@@ -220,31 +228,29 @@ class HierarchicalFactorSplitCP:
         self._check_ready()
 
         A = self._row_prior_cov(i, t)  # (r,r)
-        invA = torch.diag(1.0 / torch.diagonal(A))
+        invA = np.diag(1.0 / np.diag(A))
 
-        if obs_idx.numel() == 0:
+        if obs_idx.size == 0:
             r = A.shape[0]
-            return torch.zeros(r, device=A.device, dtype=A.dtype), A
+            return np.zeros(r, dtype=A.dtype), A
 
-        L_obs = self.L.index_select(0, obs_idx)  # (Jo,r)
-        D_obs_diag = self._row_idio_diag(i).index_select(0, obs_idx)  # (Jo,)
-        invD_obs = torch.diag(1.0 / torch.clamp(D_obs_diag, min=self.eps))
+        L_obs = self.L[obs_idx]  # (Jo,r)
+        D_obs_diag = self._row_idio_diag(i)[obs_idx]  # (Jo,)
+        invD_obs = np.diag(1.0 / np.clip(D_obs_diag, self.eps, None))
 
         precision = invA + L_obs.T @ invD_obs @ L_obs
-        precision = precision + self.jitter * torch.eye(
-            precision.shape[0], device=precision.device, dtype=precision.dtype
-        )
-        A_post = torch.linalg.inv(precision)
+        precision = precision + self.jitter * np.eye(precision.shape[0], dtype=precision.dtype)
+        A_post = np.linalg.inv(precision)
         f_post = A_post @ L_obs.T @ invD_obs @ residual_obs
         return f_post, A_post
 
     def score_row(
         self,
-        Y: torch.Tensor,
-        M_mask: torch.Tensor,
+        Y: np.ndarray,
+        M_mask: np.ndarray,
         i: int,
         t: int,
-        mu: Optional[torch.Tensor] = None,
+        mu: Optional[np.ndarray] = None,
     ) -> HierarchicalRowScore:
         """
         Compute hierarchical score for a single row (i,t).
@@ -255,62 +261,69 @@ class HierarchicalFactorSplitCP:
         """
         self._check_ready()
 
-        device = self._device()
         dtype = self._dtype()
 
-        y_row = Y[i, t].to(device=device, dtype=dtype)
-        m_row = M_mask[i, t].to(device=device)
-        obs_idx = torch.nonzero(m_row, as_tuple=False).squeeze(1)
+        y_row = _as_numpy_array(Y[i, t], dtype=dtype)
+        m_row = _as_numpy_array(M_mask[i, t], dtype=bool)
+        obs_idx = np.flatnonzero(m_row)
 
         if mu is None:
-            mu_row = torch.zeros_like(y_row)
+            mu_row = np.zeros_like(y_row)
         else:
-            mu_row = mu[i, t].to(device=device, dtype=dtype)
+            mu_row = _as_numpy_array(mu[i, t], dtype=dtype)
 
-        if obs_idx.numel() == 0:
+        if obs_idx.size == 0:
             return HierarchicalRowScore(
                 total=float("nan"),
                 latent=float("nan"),
                 idio=float("nan"),
                 num_obs=0,
-                f_post=torch.zeros(self.L.shape[1], device=device, dtype=dtype),
-                eps_hat_obs=torch.empty(0, device=device, dtype=dtype),
+                f_post=np.zeros(self.L.shape[1], dtype=dtype),
+                eps_hat_obs=np.empty(0, dtype=dtype),
             )
 
-        residual_obs = (y_row - mu_row).index_select(0, obs_idx)
+        try:
+            residual_obs = (y_row - mu_row)[obs_idx]
+        except Exception as e:
+            print("Error while computing residual_obs in score_row:")
+            print("y_row:", y_row)
+            print("M_mask[i,t]:", M_mask[i,t])
+            print("mu_row:", mu_row)
+            print("obs_idx:", obs_idx)
+            raise
         f_post, _ = self._posterior_factor_given_obs(i=i, t=t, residual_obs=residual_obs, obs_idx=obs_idx)
 
         # latent score: ||f_post||_{A^{-1}}
-        a2_it = torch.clamp(self.a2[i, t], min=self.eps)
-        latent_score = torch.sqrt(torch.sum((f_post ** 2) / a2_it).clamp_min(0.0))
+        a2_it = np.clip(self.a2[i, t], self.eps, None)
+        latent_score = float(np.sqrt(np.clip(np.sum((f_post ** 2) / a2_it), 0.0, None)))
 
         # idiosyncratic residual on observed channels
-        L_obs = self.L.index_select(0, obs_idx)
+        L_obs = self.L[obs_idx]
         eps_hat_obs = residual_obs - L_obs @ f_post
-        idio_sd_obs = self.s[i] * torch.sqrt(torch.clamp(self.psi.index_select(0, obs_idx), min=self.eps))
-        idio_z = torch.abs(eps_hat_obs) / torch.clamp(idio_sd_obs, min=self.eps)
-        idio_score = torch.max(idio_z)
+        idio_sd_obs = self.s[i] * np.sqrt(np.clip(self.psi[obs_idx], self.eps, None))
+        idio_z = np.abs(eps_hat_obs) / np.clip(idio_sd_obs, self.eps, None)
+        idio_score = float(np.max(idio_z))
 
-        total = torch.maximum(latent_score, idio_score)
+        total = max(latent_score, idio_score)
 
         return HierarchicalRowScore(
-            total=float(total.detach().cpu().item()),
-            latent=float(latent_score.detach().cpu().item()),
-            idio=float(idio_score.detach().cpu().item()),
-            num_obs=int(obs_idx.numel()),
+            total=float(total),
+            latent=float(latent_score),
+            idio=float(idio_score),
+            num_obs=int(obs_idx.size),
             f_post=f_post,
             eps_hat_obs=eps_hat_obs,
         )
 
     def score_rows(
         self,
-        Y: torch.Tensor,
-        M_mask: torch.Tensor,
+        Y: np.ndarray,
+        M_mask: np.ndarray,
         row_indices: Optional[Sequence[Tuple[int, int]]] = None,
-        mu: Optional[torch.Tensor] = None,
+        mu: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         """
-        Score multiple rows and return tensors/dicts for diagnostics.
+        Score multiple rows and return arrays/dicts for diagnostics.
         """
         if row_indices is None:
             row_indices = all_nonempty_row_indices(M_mask)
@@ -329,24 +342,23 @@ class HierarchicalFactorSplitCP:
             idios.append(out.idio)
             kept_rows.append((i, t))
 
-        device = self._device()
         dtype = self._dtype()
 
         return {
             "rows": kept_rows,
-            "total": torch.tensor(totals, device=device, dtype=dtype),
-            "latent": torch.tensor(latents, device=device, dtype=dtype),
-            "idio": torch.tensor(idios, device=device, dtype=dtype),
+            "total": np.asarray(totals, dtype=dtype),
+            "latent": np.asarray(latents, dtype=dtype),
+            "idio": np.asarray(idios, dtype=dtype),
         }
 
     def calibrate(
         self,
-        Y_cal: torch.Tensor,
-        M_cal: torch.Tensor,
+        Y_cal: np.ndarray,
+        M_cal: np.ndarray,
         row_indices: Optional[Sequence[Tuple[int, int]]] = None,
-        mu_cal: Optional[torch.Tensor] = None,
-        row_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        mu_cal: Optional[np.ndarray] = None,
+        row_weights: Optional[np.ndarray] = None,
+    ) -> float:
         """
         Calibrate qhat on row-level calibration data.
 
@@ -361,34 +373,34 @@ class HierarchicalFactorSplitCP:
         if row_weights is None:
             qhat = higher_quantile(scores, self.alpha)
         else:
-            row_weights = row_weights.reshape(-1).to(device=scores.device, dtype=scores.dtype)
+            row_weights = _as_numpy_array(row_weights, dtype=scores.dtype).reshape(-1)
             if row_indices is None:
-                if row_weights.numel() != len(rows):
+                if row_weights.size != len(rows):
                     raise ValueError("row_weights must match the number of kept calibration rows.")
                 weights_kept = row_weights
             else:
-                if row_weights.numel() != len(row_indices):
+                if row_weights.size != len(row_indices):
                     raise ValueError("row_weights must match row_indices length.")
                 # keep only weights corresponding to rows that survived scoring
                 row_to_weight = {tuple(row_indices[k]): row_weights[k] for k in range(len(row_indices))}
-                weights_kept = torch.stack([row_to_weight[(i, t)] for (i, t) in rows], dim=0)
+                weights_kept = np.asarray([row_to_weight[(i, t)] for (i, t) in rows], dtype=scores.dtype)
             qhat = weighted_higher_quantile(scores, weights_kept, self.alpha)
 
-        self.qhat = qhat
+        self.qhat = float(qhat)
         self.cal_scores_ = scores
         self.cal_rows_ = rows
-        return qhat
+        return self.qhat
 
     def predict_box_row(
         self,
         i: int,
         t: int,
-        mu_row: torch.Tensor,
-        qhat: Optional[torch.Tensor] = None,
-        observed_y: Optional[torch.Tensor] = None,
-        observed_mask: Optional[torch.Tensor] = None,
+        mu_row: np.ndarray,
+        qhat: Optional[float] = None,
+        observed_y: Optional[np.ndarray] = None,
+        observed_mask: Optional[np.ndarray] = None,
         degenerate_observed: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
         """
         Conservative channelwise inversion of the hierarchical score.
 
@@ -404,29 +416,28 @@ class HierarchicalFactorSplitCP:
         This is conservative but easy to compute.
         """
         self._check_ready()
-        device = self._device()
         dtype = self._dtype()
 
         if qhat is None:
             if self.qhat is None:
                 raise RuntimeError("No qhat stored. Call calibrate(...) or pass qhat explicitly.")
-            q = self.qhat.to(device=device, dtype=dtype)
+            q = dtype.type(self.qhat)
         else:
-            q = qhat.to(device=device, dtype=dtype)
+            q = dtype.type(qhat)
 
-        mu_row = mu_row.to(device=device, dtype=dtype)
+        mu_row = _as_numpy_array(mu_row, dtype=dtype)
 
         if observed_y is None or observed_mask is None:
-            f_post = torch.zeros(self.L.shape[1], device=device, dtype=dtype)
+            f_post = np.zeros(self.L.shape[1], dtype=dtype)
             A_post = self._row_prior_cov(i, t)
-            obs_idx = torch.empty(0, dtype=torch.long, device=device)
+            obs_idx = np.empty(0, dtype=int)
             observed_y = None
             observed_mask = None
         else:
-            observed_y = observed_y.to(device=device, dtype=dtype)
-            observed_mask = observed_mask.to(device=device)
-            obs_idx = torch.nonzero(observed_mask, as_tuple=False).squeeze(1)
-            residual_obs = (observed_y - mu_row).index_select(0, obs_idx)
+            observed_y = _as_numpy_array(observed_y, dtype=dtype)
+            observed_mask = _as_numpy_array(observed_mask, dtype=bool)
+            obs_idx = np.flatnonzero(observed_mask)
+            residual_obs = (observed_y - mu_row)[obs_idx]
             f_post, A_post = self._posterior_factor_given_obs(
                 i=i, t=t, residual_obs=residual_obs, obs_idx=obs_idx
             )
@@ -437,19 +448,19 @@ class HierarchicalFactorSplitCP:
 
         # channelwise latent uncertainty after conditioning
         LA = self.L @ A_post
-        latent_var = torch.sum(LA * self.L, dim=1).clamp_min(0.0)
-        latent_sd = torch.sqrt(latent_var)
+        latent_var = np.clip(np.sum(LA * self.L, axis=1), 0.0, None)
+        latent_sd = np.sqrt(latent_var)
 
         # channelwise idiosyncratic uncertainty
-        idio_sd = self.s[i] * torch.sqrt(torch.clamp(self.psi, min=self.eps))
+        idio_sd = self.s[i] * np.sqrt(np.clip(self.psi, self.eps, None))
 
         half_width = q * (latent_sd + idio_sd)
         lower = center - half_width
         upper = center + half_width
 
-        if degenerate_observed and observed_y is not None and observed_mask is not None and obs_idx.numel() > 0:
-            lower = lower.clone()
-            upper = upper.clone()
+        if degenerate_observed and observed_y is not None and observed_mask is not None and obs_idx.size > 0:
+            lower = lower.copy()
+            upper = upper.copy()
             lower[obs_idx] = observed_y[obs_idx]
             upper[obs_idx] = observed_y[obs_idx]
 
@@ -467,16 +478,16 @@ class HierarchicalFactorSplitCP:
     def predict_box_dataset(
         self,
         row_indices: Sequence[Tuple[int, int]],
-        mu: torch.Tensor,
-        qhat: Optional[torch.Tensor] = None,
-        observed_Y: Optional[torch.Tensor] = None,
-        observed_M: Optional[torch.Tensor] = None,
+        mu: np.ndarray,
+        qhat: Optional[float] = None,
+        observed_Y: Optional[np.ndarray] = None,
+        observed_M: Optional[np.ndarray] = None,
         degenerate_observed: bool = True,
-    ) -> Dict[Tuple[int, int], Dict[str, torch.Tensor]]:
+    ) -> Dict[Tuple[int, int], Dict[str, np.ndarray]]:
         """
         Batch wrapper around predict_box_row.
         """
-        out: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        out: Dict[Tuple[int, int], Dict[str, np.ndarray]] = {}
         for (i, t) in row_indices:
             mu_row = mu[i, t]
             if observed_Y is None or observed_M is None:
@@ -537,7 +548,7 @@ class HierarchicalFactorSplitCP:
 #
 # 4) Calibrate:
 #
-#    mu_full = torch.zeros_like(Y_resid_full)   # or your fitted mean tensor
+#    mu_full = np.zeros_like(Y_resid_full)      # or your fitted mean tensor
 #    qhat = hfcp.calibrate(
 #        Y_cal=Y_resid_full,
 #        M_cal=M_mask_full,
