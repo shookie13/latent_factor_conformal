@@ -99,6 +99,21 @@ def all_nonempty_row_indices(M_mask: np.ndarray) -> List[Tuple[int, int]]:
                 out.append((i, t))
     return out
 
+def _psd_sqrt_factor_numpy(M: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """
+    Return F such that approximately M ≈ F.T @ F, with negative eigenvalues clipped to 0.
+    M should be symmetric.
+    """
+    M = np.asarray(M, dtype=float)
+    M = 0.5 * (M + M.T)
+    evals, evecs = np.linalg.eigh(M)
+    evals_clipped = np.clip(evals, 0.0, None)
+    keep = evals_clipped > eps
+    if not np.any(keep):
+        return np.zeros((0, M.shape[0]), dtype=float)
+    # F = diag(sqrt(evals)) @ Q^T, so F.T F = Q diag(evals) Q^T
+    F = (np.sqrt(evals_clipped[keep])[:, None] * evecs[:, keep].T)
+    return F
 
 @dataclass
 class HierarchicalRowScore:
@@ -739,15 +754,16 @@ class HierarchicalFactorSplitCP:
         C = mats["C"]
 
         B = 0.5 * (B + B.T)
+        F = _psd_sqrt_factor_numpy(B)
 
         y_var = cp.Variable(J)
         r_expr = y_var - mu_np
 
         constraints = [
-            cp.quad_form(r_expr, B) <= q ** 2,
-            C @ r_expr <= q,
-            -(C @ r_expr) <= q,
-        ]
+        cp.sum_squares(F @ r_expr) <= q ** 2,
+        C @ r_expr <= q,
+        -(C @ r_expr) <= q,
+    ]
 
         obs_idx = np.array([], dtype=int)
         tgt_idx = np.arange(J, dtype=int)
@@ -847,14 +863,14 @@ class HierarchicalFactorSplitCP:
         prob_min.solve(solver=solver, **solver_opts)
         status_min = prob_min.status
         if status_min not in ("optimal", "optimal_inaccurate"):
-            raise RuntimeError(f"Minimization for channel {j} failed with status={status_min}")
+            raise RuntimeError(f"Minimization for subject {i}, time {t}, channel {j} failed with status={status_min}")
 
         lo = float(y_var.value[j])
 
         prob_max.solve(solver=solver, **solver_opts)
         status_max = prob_max.status
         if status_max not in ("optimal", "optimal_inaccurate"):
-            raise RuntimeError(f"Maximization for channel {j} failed with status={status_max}")
+            raise RuntimeError(f"Maximization for subject {i}, time {t}, channel {j} failed with status={status_max}")
 
         hi = float(y_var.value[j])
 
