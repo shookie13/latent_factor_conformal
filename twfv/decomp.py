@@ -1,1056 +1,990 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.stats import chi2
 
 
-def _as_numpy_array(x: Any, dtype: Optional[np.dtype] = None) -> np.ndarray:
-    if isinstance(x, np.ndarray):
-        arr = x
-    elif hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
-        arr = x.detach().cpu().numpy()
-    else:
-        arr = np.asarray(x)
+def _flatten_rows_lastdim(arr: np.ndarray) -> np.ndarray:
+    """
+    Flatten all leading dimensions into one row dimension, keep the last dim.
+    Example:
+        (I, T, J) -> (I*T, J)
+    """
+    arr = np.asarray(arr)
+    if arr.ndim < 2:
+        raise ValueError("Expected at least 2 dimensions.")
+    return arr.reshape(-1, arr.shape[-1])
 
-    if dtype is not None:
-        arr = arr.astype(dtype, copy=False)
-    return arr
+
+def _flatten_rows_last2dims(arr: np.ndarray) -> np.ndarray:
+    """
+    Flatten all leading dimensions into one row dimension, keep the last 2 dims.
+    Example:
+        (I, T, J, J) -> (I*T, J, J)
+    """
+    arr = np.asarray(arr)
+    if arr.ndim < 3:
+        raise ValueError("Expected at least 3 dimensions.")
+    return arr.reshape(-1, arr.shape[-2], arr.shape[-1])
 
 
-def higher_quantile(scores: np.ndarray, alpha: float) -> float:
+def _higher_quantile(scores: np.ndarray, alpha: float) -> float:
     """
     Split-conformal 'higher' quantile:
-        q = sorted_scores[ ceil((n+1)*(1-alpha)) - 1 ]
+        q = sorted_scores[ ceil((n+1)*(1-alpha)) - 1 ].
     """
-    scores = _as_numpy_array(scores).reshape(-1)
+    scores = np.asarray(scores, dtype=float).ravel()
     if scores.size == 0:
-        raise ValueError("No scores provided.")
-    scores_sorted = np.sort(scores)
-    n = scores_sorted.size
+        raise ValueError("No calibration scores were produced.")
+    s = np.sort(scores)
+    n = s.size
     k = int(math.ceil((n + 1) * (1.0 - alpha)))
     k = min(max(k, 1), n)
-    return float(scores_sorted[k - 1])
+    return float(s[k - 1])
 
 
-def weighted_higher_quantile(
-    scores: np.ndarray,
-    weights: np.ndarray,
-    alpha: float,
-    eps: float = 1e-12,
-) -> float:
+def _symmetrize(M: np.ndarray) -> np.ndarray:
+    return 0.5 * (M + M.T)
+
+
+def _solve_spd(A: np.ndarray, b: np.ndarray, jitter: float = 1e-8) -> np.ndarray:
     """
-    Weighted empirical quantile with 'higher'-style behavior:
-    smallest score whose cumulative normalized weight >= 1 - alpha.
-
-    This is useful if you later want latent-space localization weights.
+    Numerically stable solve for symmetric positive definite-ish systems.
     """
-    scores = _as_numpy_array(scores).reshape(-1)
-    weights = _as_numpy_array(weights).reshape(-1)
-    if scores.size == 0:
-        raise ValueError("No scores provided.")
-    if scores.size != weights.size:
-        raise ValueError("scores and weights must have the same length.")
-
-    weights = np.clip(weights, 0.0, None)
-    wsum = weights.sum()
-    if wsum <= eps:
-        return higher_quantile(scores, alpha)
-
-    order = np.argsort(scores)
-    s = scores[order]
-    w = weights[order] / wsum
-    cdf = np.cumsum(w)
-    idx = np.searchsorted(cdf, 1.0 - alpha, side="left")
-    idx = min(int(idx), s.size - 1)
-    return float(s[idx])
+    A = _symmetrize(np.asarray(A, dtype=float))
+    n = A.shape[0]
+    A = A + jitter * np.eye(n)
+    return np.linalg.solve(A, b)
 
 
-def unique_row_indices_from_flat_ijt(flat_idx: np.ndarray, J: int, T: int) -> List[Tuple[int, int]]:
-    """
-    Convert flattened channel-level indices k = i*(J*T) + j*T + t
-    into unique row-level indices (i,t).
+def _safe_inv_spd(A: np.ndarray, jitter: float = 1e-8) -> np.ndarray:
+    A = _symmetrize(np.asarray(A, dtype=float))
+    n = A.shape[0]
+    A = A + jitter * np.eye(n)
+    return np.linalg.inv(A)
 
-    Important:
-    This is only a compatibility helper for your current pipeline.
-    For this hierarchical score, the clean split should really be done
-    at the row level from the beginning.
-    """
-    flat_idx = np.asarray(flat_idx, dtype=int).ravel()
-    if flat_idx.size == 0:
-        return []
-
-    i = flat_idx // (J * T)
-    t = flat_idx % T
-    rows = np.stack([i, t], axis=1)
-    rows = np.unique(rows, axis=0)
-    return [(int(ii), int(tt)) for ii, tt in rows]
-
-
-def all_nonempty_row_indices(M_mask: np.ndarray) -> List[Tuple[int, int]]:
-    """
-    Return all (i,t) rows with at least one observed channel.
-    """
-    I, T, _ = M_mask.shape
-    out: List[Tuple[int, int]] = []
-    for i in range(I):
-        for t in range(T):
-            if bool(np.any(M_mask[i, t])):
-                out.append((i, t))
-    return out
 
 def _psd_sqrt_factor_numpy(M: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     """
-    Return F such that approximately M ≈ F.T @ F, with negative eigenvalues clipped to 0.
-    M should be symmetric.
+    Return F such that approximately M ≈ F.T @ F, clipping tiny negative eigvals.
     """
-    M = np.asarray(M, dtype=float)
-    M = 0.5 * (M + M.T)
+    M = _symmetrize(np.asarray(M, dtype=float))
     evals, evecs = np.linalg.eigh(M)
-    evals_clipped = np.clip(evals, 0.0, None)
-    keep = evals_clipped > eps
+    evals = np.clip(evals, 0.0, None)
+    keep = evals > eps
     if not np.any(keep):
         return np.zeros((0, M.shape[0]), dtype=float)
-    # F = diag(sqrt(evals)) @ Q^T, so F.T F = Q diag(evals) Q^T
-    F = (np.sqrt(evals_clipped[keep])[:, None] * evecs[:, keep].T)
-    return F
+    return (np.sqrt(evals[keep])[:, None] * evecs[:, keep].T)
+
 
 @dataclass
-class HierarchicalRowScore:
-    total: float
-    latent: float
-    idio: float
-    num_obs: int
-    f_post: np.ndarray
-    eps_hat_obs: np.ndarray
+class ScoreRecord:
+    row: int
+    score: float
+    raw_score: float
+    observed_idx: np.ndarray
+    target_idx: np.ndarray
 
-@dataclass
-class ExactRegionScore:
-    total: float
-    latent: float
-    idio: float
-    r: np.ndarray
-    f_post_full: np.ndarray
-    eps_hat_full: np.ndarray
 
-class HierarchicalFactorSplitCP:
+class PartialOutputConformalCP:
     """
-    Hierarchical factor-score split conformal wrapper.
+    Partially observed-output conformal predictor.
 
-    Assumes you already have fitted factor-model outputs for the rows you want to score:
-        L   : (J, r)
-        a2  : (I, T, r)
-        psi : (J,)
-        s   : (I,)
+    Supports two score families:
+      - score_kind="mahalanobis"
+      - score_kind="hierarchical"
 
-    The wrapper calibrates a scalar nonconformity score per row (i,t),
-    and returns a conservative channelwise prediction box by inverting:
-        score = max(latent_score, idio_score)
+    Supports two calibration modes:
+      - calibration_mode="observed"
+          Calibrate on the actually observed subvector only.
+          This is the cleanest choice for Mahalanobis + PIT.
+      - calibration_mode="pseudo_mask"
+          Randomly split the observed coordinates into
+          revealed part R and pseudo-hidden part H, then calibrate on H | R.
+          This is the better-aligned choice when the deployment task is
+          "predict missing coordinates from observed coordinates."
 
-    If you provide partially observed outputs at prediction time, the method
-    conditions on them via Gaussian posterior updating of the latent factor.
+    Parameters
+    ----------
+    mu : array, shape (..., J)
+        Row-wise predictive means.
+    Sigma : array, shape (..., J, J), optional
+        Row-wise predictive covariances. Needed for Mahalanobis mode if factor
+        parameters are not supplied.
+    L : array, shape (J, r), optional
+        Loading matrix. Needed for hierarchical mode.
+    A_diag : array, shape (..., r), optional
+        Row-wise latent variances (diagonal of A_m).
+    D_diag : array, shape (..., J), optional
+        Row-wise idiosyncratic diagonal variances (diagonal of D_m).
+    alpha : float
+        Target miscoverage level.
+    score_kind : {"mahalanobis", "hierarchical"}
+    calibration_mode : {"observed", "pseudo_mask"}
+    use_pit : bool
+        If True:
+          - Mahalanobis mode uses chi-square PIT.
+          - Hierarchical mode currently supports use_pit=False only.
+    pseudo_hidden_frac : float
+        Fraction of observed coordinates to pseudo-hide in pseudo_mask mode.
+    min_hidden : int
+        Minimum number of pseudo-hidden coordinates.
+    n_mc : int
+        Reserved for future Monte Carlo extensions; not required in the current
+        Mahalanobis implementation.
+    random_state : int or None
+    jitter : float
+        Numerical stabilization for covariance solves.
+    solver : str
+        CVXPY solver name for hierarchical exact projections / conditional scores.
+    solver_opts : dict or None
+        Passed into CVXPY solve().
     """
 
     def __init__(
         self,
+        mu: np.ndarray,
+        *,
+        Sigma: Optional[np.ndarray] = None,
+        L: Optional[np.ndarray] = None,
+        A_diag: Optional[np.ndarray] = None,
+        D_diag: Optional[np.ndarray] = None,
         alpha: float = 0.1,
-        jitter: float = 1e-6,
-        eps: float = 1e-12,
+        score_kind: str = "mahalanobis",
+        calibration_mode: str = "pseudo_mask",
+        use_pit: bool = True,
+        pseudo_hidden_frac: float = 0.3,
+        min_hidden: int = 1,
+        n_mc: int = 1000,
+        random_state: Optional[int] = None,
+        jitter: float = 1e-8,
+        solver: str = "SCS",
+        solver_opts: Optional[Dict[str, Any]] = None,
     ):
         self.alpha = float(alpha)
+        self.score_kind = str(score_kind).lower()
+        self.calibration_mode = str(calibration_mode).lower()
+        self.use_pit = bool(use_pit)
+        self.pseudo_hidden_frac = float(pseudo_hidden_frac)
+        self.min_hidden = int(min_hidden)
+        self.n_mc = int(n_mc)
         self.jitter = float(jitter)
-        self.eps = float(eps)
+        self.solver = str(solver)
+        self.solver_opts = {"verbose": False} if solver_opts is None else dict(solver_opts)
+        self.rng = np.random.default_rng(random_state)
 
-        self.L: Optional[np.ndarray] = None
-        self.a2: Optional[np.ndarray] = None
-        self.psi: Optional[np.ndarray] = None
-        self.s: Optional[np.ndarray] = None
+        self.mu = _flatten_rows_lastdim(np.asarray(mu, dtype=float))
+        self.N, self.J = self.mu.shape
 
-        self.qhat: Optional[float] = None
-        self.cal_scores_: Optional[np.ndarray] = None
-        self.cal_rows_: Optional[List[Tuple[int, int]]] = None
+        self.Sigma = None
+        if Sigma is not None:
+            self.Sigma = _flatten_rows_last2dims(np.asarray(Sigma, dtype=float))
+            if self.Sigma.shape[0] != self.N or self.Sigma.shape[1:] != (self.J, self.J):
+                raise ValueError("Sigma has incompatible shape.")
 
-    @classmethod
-    def from_run_em_like(
-        cls,
-        em_out: Sequence[Any],
-        alpha: float = 0.1,
-        jitter: float = 1e-6,
-        eps: float = 1e-12,
-    ) -> "HierarchicalFactorSplitCP":
-        """
-        Build from your existing run_em_like output.
+        self.L = None
+        self.A_diag = None
+        self.D_diag = None
+        self.r = None
 
-        Expected leading entries:
-            L, a2, psi, s, ...
-        """
-        obj = cls(alpha=alpha, jitter=jitter, eps=eps)
-        if len(em_out) < 4:
-            raise ValueError("em_out must start with (L, a2, psi, s, ...).")
-        obj.set_factor_params(em_out[0], em_out[1], em_out[2], em_out[3])
-        return obj
+        if L is not None:
+            self.L = np.asarray(L, dtype=float)
+            if self.L.ndim != 2 or self.L.shape[0] != self.J:
+                raise ValueError("L must have shape (J, r).")
+            self.r = self.L.shape[1]
 
-    def set_factor_params(
+        if A_diag is not None:
+            self.A_diag = _flatten_rows_lastdim(np.asarray(A_diag, dtype=float))
+            if self.A_diag.shape[0] != self.N:
+                raise ValueError("A_diag has incompatible row count.")
+            if self.r is not None and self.A_diag.shape[1] != self.r:
+                raise ValueError("A_diag second dimension must match L.shape[1].")
+            self.r = self.A_diag.shape[1]
+
+        if D_diag is not None:
+            self.D_diag = _flatten_rows_lastdim(np.asarray(D_diag, dtype=float))
+            if self.D_diag.shape != (self.N, self.J):
+                raise ValueError("D_diag must have shape (..., J).")
+
+        if self.score_kind not in {"mahalanobis", "hierarchical"}:
+            raise ValueError("score_kind must be 'mahalanobis' or 'hierarchical'.")
+
+        if self.calibration_mode not in {"observed", "pseudo_mask"}:
+            raise ValueError("calibration_mode must be 'observed' or 'pseudo_mask'.")
+
+        if self.score_kind == "hierarchical":
+            if self.L is None or self.A_diag is None or self.D_diag is None:
+                raise ValueError(
+                    "hierarchical mode requires L, A_diag, and D_diag."
+                )
+
+        if self.score_kind == "mahalanobis":
+            if self.Sigma is None and (self.L is None or self.A_diag is None or self.D_diag is None):
+                raise ValueError(
+                    "mahalanobis mode requires either Sigma or (L, A_diag, D_diag)."
+                )
+
+        # if self.score_kind == "hierarchical" and self.use_pit:
+        #     raise NotImplementedError(
+        #         "Hierarchical mode currently uses raw scores only. "
+        #         "Set use_pit=False."
+        #     )
+
+        self.qhat_: Optional[float] = None
+        self.calibration_scores_: Optional[np.ndarray] = None
+        self.calibration_records_: Optional[List[ScoreRecord]] = None
+
+    # ------------------------------------------------------------------
+    # Row-wise model access
+    # ------------------------------------------------------------------
+
+    def _row_A(self, n: int) -> np.ndarray:
+        a = np.asarray(self.A_diag[n], dtype=float)
+        return np.diag(np.clip(a, self.jitter, None))
+
+    def _row_D_diag(self, n: int) -> np.ndarray:
+        d = np.asarray(self.D_diag[n], dtype=float)
+        return np.clip(d, self.jitter, None)
+
+    def _row_D(self, n: int) -> np.ndarray:
+        return np.diag(self._row_D_diag(n))
+
+    def _row_Sigma(self, n: int) -> np.ndarray:
+        if self.Sigma is not None:
+            return _symmetrize(self.Sigma[n])
+        A = self._row_A(n)
+        D = self._row_D(n)
+        return _symmetrize(self.L @ A @ self.L.T + D)
+
+    def _subset_cov(self, n: int, idx: np.ndarray) -> np.ndarray:
+        idx = np.asarray(idx, dtype=int)
+        if self.Sigma is not None:
+            S = self._row_Sigma(n)
+            return _symmetrize(S[np.ix_(idx, idx)])
+        Ls = self.L[idx]
+        A = self._row_A(n)
+        ds = self._row_D_diag(n)[idx]
+        return _symmetrize(Ls @ A @ Ls.T + np.diag(ds))
+
+    def _subset_mean(self, n: int, idx: np.ndarray) -> np.ndarray:
+        return self.mu[n, idx]
+
+    # ------------------------------------------------------------------
+    # Gaussian conditional law for Mahalanobis mode and pseudo-mask bridge
+    # ------------------------------------------------------------------
+
+    def _conditional_gaussian(
         self,
-        L: np.ndarray,
-        a2: np.ndarray,
-        psi: np.ndarray,
-        s: np.ndarray,
-    ) -> None:
-        self.L = _as_numpy_array(L)
-        self.a2 = _as_numpy_array(a2, dtype=self.L.dtype)
-        self.psi = _as_numpy_array(psi, dtype=self.L.dtype)
-        self.s = _as_numpy_array(s, dtype=self.L.dtype)
-
-    def _check_ready(self) -> None:
-        if self.L is None or self.a2 is None or self.psi is None or self.s is None:
-            raise RuntimeError("Factor parameters are not set. Call set_factor_params(...) first.")
-
-    def _dtype(self) -> np.dtype:
-        self._check_ready()
-        return self.L.dtype
-
-    def _row_prior_cov(self, i: int, t: int) -> np.ndarray:
-        """
-        A_it = diag(a2[i,t]) in factor space.
-        """
-        self._check_ready()
-        return np.diag(np.clip(self.a2[i, t], self.eps, None))
-
-    def _row_idio_diag(self, i: int) -> np.ndarray:
-        """
-        D_i = s_i^2 * diag(psi)
-        """
-        self._check_ready()
-        return (self.s[i] ** 2) * np.clip(self.psi, self.eps, None)
-
-    def _posterior_factor_given_obs(
-        self,
-        i: int,
-        t: int,
-        residual_obs: np.ndarray,
+        n: int,
         obs_idx: np.ndarray,
+        target_idx: np.ndarray,
+        y_obs: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Gaussian posterior of latent factor f | observed residuals.
+        Return (conditional_mean, conditional_cov) of target coords given observed coords.
+        """
+        obs_idx = np.asarray(obs_idx, dtype=int)
+        target_idx = np.asarray(target_idx, dtype=int)
 
-        Prior:
-            f ~ N(0, A_it),  A_it = diag(a2[i,t])
+        if target_idx.size == 0:
+            return np.empty(0, dtype=float), np.empty((0, 0), dtype=float)
 
-        Observation model on observed channels:
-            r_obs = L_obs f + e_obs,
-            e_obs ~ N(0, D_obs), D_obs = s_i^2 diag(psi_obs)
+        mu = self.mu[n]
+        Sigma = self._row_Sigma(n)
+
+        mu_O = mu[obs_idx]
+        mu_U = mu[target_idx]
+        S_OO = _symmetrize(Sigma[np.ix_(obs_idx, obs_idx)])
+        S_UO = Sigma[np.ix_(target_idx, obs_idx)]
+        S_OU = Sigma[np.ix_(obs_idx, target_idx)]
+        S_UU = _symmetrize(Sigma[np.ix_(target_idx, target_idx)])
+
+        if obs_idx.size == 0:
+            return mu_U.copy(), S_UU.copy()
+
+        diff = np.asarray(y_obs, dtype=float) - mu_O
+        beta = _solve_spd(S_OO, diff, jitter=self.jitter)
+        cond_mu = mu_U + S_UO @ beta
+
+        S_OO_inv_S_OU = _solve_spd(S_OO, S_OU, jitter=self.jitter)
+        cond_cov = _symmetrize(S_UU - S_UO @ S_OO_inv_S_OU)
+
+        # Small diagonal stabilization
+        cond_cov = cond_cov + self.jitter * np.eye(cond_cov.shape[0])
+        return cond_mu, cond_cov
+
+    # ------------------------------------------------------------------
+    # Factor posterior
+    # ------------------------------------------------------------------
+
+    def _posterior_latent_from_obs(
+        self,
+        n: int,
+        obs_idx: np.ndarray,
+        y_obs: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Posterior of latent factor f given observed coordinates only.
 
         Returns
         -------
-        f_post : (r,)
-            posterior mean of latent factor
-        A_post : (r, r)
-            posterior covariance of latent factor
+        m_post : shape (r,)
+        A_post : shape (r, r)
         """
-        self._check_ready()
-
-        A = self._row_prior_cov(i, t)  # (r,r)
-        invA = np.diag(1.0 / np.diag(A))
-
+        obs_idx = np.asarray(obs_idx, dtype=int)
+        A = self._row_A(n)
         if obs_idx.size == 0:
-            r = A.shape[0]
-            return np.zeros(r, dtype=A.dtype), A
+            return np.zeros(A.shape[0], dtype=float), A.copy()
 
-        L_obs = self.L[obs_idx]  # (Jo,r)
-        D_obs_diag = self._row_idio_diag(i)[obs_idx]  # (Jo,)
-        invD_obs = np.diag(1.0 / np.clip(D_obs_diag, self.eps, None))
+        mu_O = self.mu[n, obs_idx]
+        r_obs = np.asarray(y_obs, dtype=float) - mu_O
 
-        precision = invA + L_obs.T @ invD_obs @ L_obs
-        precision = precision + self.jitter * np.eye(precision.shape[0], dtype=precision.dtype)
-        A_post = np.linalg.inv(precision)
-        f_post = A_post @ L_obs.T @ invD_obs @ residual_obs
-        return f_post, A_post
+        L_O = self.L[obs_idx]
+        d_O = self._row_D_diag(n)[obs_idx]
 
-    def score_row(
+        A_inv = np.diag(1.0 / np.diag(A))
+        D_O_inv = np.diag(1.0 / d_O)
+
+        prec_post = _symmetrize(A_inv + L_O.T @ D_O_inv @ L_O)
+        A_post = _safe_inv_spd(prec_post, jitter=self.jitter)
+        m_post = A_post @ L_O.T @ D_O_inv @ r_obs
+        return m_post, A_post
+
+    # ------------------------------------------------------------------
+    # Raw scores
+    # ------------------------------------------------------------------
+
+    def _mahal_raw(
         self,
-        Y: np.ndarray,
-        M_mask: np.ndarray,
-        i: int,
-        t: int,
-        mu: Optional[np.ndarray] = None,
-    ) -> HierarchicalRowScore:
+        y: np.ndarray,
+        mu: np.ndarray,
+        Sigma: np.ndarray,
+    ) -> float:
+        y = np.asarray(y, dtype=float)
+        mu = np.asarray(mu, dtype=float)
+        if y.size == 0:
+            return 0.0
+        r = y - mu
+        z = _solve_spd(Sigma, r, jitter=self.jitter)
+        return float(r @ z)
+
+    def _hier_raw_observed_subset(
+        self,
+        n: int,
+        obs_idx: np.ndarray,
+        y_obs: np.ndarray,
+    ) -> float:
         """
-        Compute hierarchical score for a single row (i,t).
+        Raw hierarchical score on the marginal observed subset.
 
-        Y      : (I,T,J)
-        M_mask : (I,T,J) bool, True = observed
-        mu     : optional mean tensor (I,T,J); if None, zero mean is used
+        T = max( ||A^{-1/2} f_hat||_2, ||D_O^{-1/2}(r_O - L_O f_hat)||_inf )
         """
-        self._check_ready()
-
-        dtype = self._dtype()
-
-        y_row = _as_numpy_array(Y[i, t], dtype=dtype)
-        m_row = _as_numpy_array(M_mask[i, t], dtype=bool)
-        obs_idx = np.flatnonzero(m_row)
-
-        if mu is None:
-            mu_row = np.zeros_like(y_row)
-        else:
-            mu_row = _as_numpy_array(mu[i, t], dtype=dtype)
-
+        obs_idx = np.asarray(obs_idx, dtype=int)
         if obs_idx.size == 0:
-            return HierarchicalRowScore(
-                total=float("nan"),
-                latent=float("nan"),
-                idio=float("nan"),
-                num_obs=0,
-                f_post=np.zeros(self.L.shape[1], dtype=dtype),
-                eps_hat_obs=np.empty(0, dtype=dtype),
+            return np.nan
+
+        A = self._row_A(n)
+        A_inv = np.diag(1.0 / np.diag(A))
+        L_O = self.L[obs_idx]
+        d_O = self._row_D_diag(n)[obs_idx]
+        Sigma_O = self._subset_cov(n, obs_idx)
+
+        r_O = np.asarray(y_obs, dtype=float) - self._subset_mean(n, obs_idx)
+
+        z = _solve_spd(Sigma_O, r_O, jitter=self.jitter)
+        f_hat = A @ L_O.T @ z
+        eps_hat = r_O - L_O @ f_hat
+
+        latent = math.sqrt(max(float(f_hat @ A_inv @ f_hat), 0.0))
+        idio = float(np.max(np.abs(eps_hat) / np.sqrt(d_O)))
+        return max(latent, idio)
+
+    def _hier_raw_conditional(
+        self,
+        n: int,
+        obs_idx: np.ndarray,
+        y_obs: np.ndarray,
+        target_idx: np.ndarray,
+        y_target: np.ndarray,
+    ) -> float:
+        """
+        Raw hierarchical score for target coordinates conditional on observed coordinates.
+
+        T = inf_u max(
+                ||A_post^{-1/2} u||_2,
+                || D_U^{-1/2}( y_U - center_U - L_U u ) ||_inf
             )
 
+        This is solved as an SOCP in CVXPY.
+        """
         try:
-            residual_obs = (y_row - mu_row)[obs_idx]
-        except Exception as e:
-            print("Error while computing residual_obs in score_row:")
-            print("y_row:", y_row)
-            print("M_mask[i,t]:", M_mask[i,t])
-            print("mu_row:", mu_row)
-            print("obs_idx:", obs_idx)
-            raise
-        f_post, _ = self._posterior_factor_given_obs(i=i, t=t, residual_obs=residual_obs, obs_idx=obs_idx)
+            import cvxpy as cp
+        except ImportError as e:
+            raise ImportError(
+                "Hierarchical conditional scoring requires cvxpy. "
+                "Install it with `pip install cvxpy`."
+            ) from e
 
-        # latent score: ||f_post||_{A^{-1}}
-        a2_it = np.clip(self.a2[i, t], self.eps, None)
-        latent_score = float(np.sqrt(np.clip(np.sum((f_post ** 2) / a2_it), 0.0, None)))
+        obs_idx = np.asarray(obs_idx, dtype=int)
+        target_idx = np.asarray(target_idx, dtype=int)
+        y_target = np.asarray(y_target, dtype=float)
 
-        # idiosyncratic residual on observed channels
-        L_obs = self.L[obs_idx]
-        eps_hat_obs = residual_obs - L_obs @ f_post
-        idio_sd_obs = self.s[i] * np.sqrt(np.clip(self.psi[obs_idx], self.eps, None))
-        idio_z = np.abs(eps_hat_obs) / np.clip(idio_sd_obs, self.eps, None)
-        idio_score = float(np.max(idio_z))
+        if target_idx.size == 0:
+            return 0.0
 
-        total = max(latent_score, idio_score)
+        m_post, A_post = self._posterior_latent_from_obs(n, obs_idx, y_obs)
+        L_U = self.L[target_idx]
+        mu_U = self.mu[n, target_idx]
+        dU = np.sqrt(self._row_D_diag(n)[target_idx])
 
-        return HierarchicalRowScore(
-            total=float(total),
-            latent=float(latent_score),
-            idio=float(idio_score),
-            num_obs=int(obs_idx.size),
-            f_post=f_post,
-            eps_hat_obs=eps_hat_obs,
+        center_U = mu_U + L_U @ m_post
+
+        # u-score cone: ||F u||_2 <= t, where F.T F = A_post^{-1}
+        A_post_inv = _safe_inv_spd(A_post, jitter=self.jitter)
+        F = _psd_sqrt_factor_numpy(A_post_inv)
+
+        u = cp.Variable(self.r)
+        t = cp.Variable(nonneg=True)
+
+        resid = y_target - center_U - L_U @ u
+        constraints = [
+            cp.norm(F @ u, 2) <= t,
+            resid <= t * dU,
+            -resid <= t * dU,
+        ]
+        prob = cp.Problem(cp.Minimize(t), constraints)
+        prob.solve(solver=self.solver, **self.solver_opts)
+
+        if prob.status not in ("optimal", "optimal_inaccurate"):
+            raise RuntimeError(
+                f"Hierarchical score solve failed at row {n} with status={prob.status}"
+            )
+        return float(t.value)
+    # ------------------------------------------------------------------
+    # PIT / PPF
+    # ------------------------------------------------------------------
+    def _empirical_pit(self, raw_value: float, ref_scores: np.ndarray) -> float:
+        """
+        Smoothed empirical CDF:
+            \hat G(t) = (1 + #{ref <= t}) / (B + 1)
+
+        Returns a value in (0, 1].
+        """
+        ref_scores = np.asarray(ref_scores, dtype=float).ravel()
+        if ref_scores.size == 0:
+            raise ValueError("ref_scores is empty.")
+        return float((1.0 + np.sum(ref_scores <= raw_value)) / (ref_scores.size + 1.0))
+
+
+    def _empirical_ppf(self, pit_level: float, ref_scores: np.ndarray) -> float:
+        """
+        Invert the empirical CDF to get a raw-score threshold corresponding to
+        a PIT-level threshold.
+
+        Uses the 'higher' quantile convention.
+        """
+        ref_scores = np.sort(np.asarray(ref_scores, dtype=float).ravel())
+        if ref_scores.size == 0:
+            raise ValueError("ref_scores is empty.")
+        u = float(np.clip(pit_level, 0.0, 1.0))
+        B = ref_scores.size
+        k = int(math.ceil(u * (B + 1))) - 1
+        k = min(max(k, 0), B - 1)
+        return float(ref_scores[k])
+
+
+    def _rng_multivariate_normal(
+        self,
+        mean: np.ndarray,
+        cov: np.ndarray,
+        size: int,
+    ) -> np.ndarray:
+        """
+        Draw samples from N(mean, cov) with small stabilization.
+        Returns shape (size, d).
+        """
+        mean = np.asarray(mean, dtype=float).reshape(-1)
+        cov = _symmetrize(np.asarray(cov, dtype=float))
+        d = mean.size
+        cov = cov + self.jitter * np.eye(d)
+        return self.rng.multivariate_normal(mean=mean, cov=cov, size=size)
+
+
+    def _hier_ref_scores_observed(
+        self,
+        n: int,
+        obs_idx: np.ndarray,
+        B: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Monte Carlo reference distribution for the raw hierarchical score on the
+        observed subset only:
+            T_obs = max( ||A^{-1/2} f_hat||_2,
+                        ||D_O^{-1/2}(r_O - L_O f_hat)||_inf )
+
+        Simulate Y_O ~ N(mu_O, Sigma_O).
+        """
+        obs_idx = np.asarray(obs_idx, dtype=int)
+        if obs_idx.size == 0:
+            return np.array([0.0], dtype=float)
+
+        if B is None:
+            B = self.n_mc
+
+        mu_O = self._subset_mean(n, obs_idx)
+        Sigma_O = self._subset_cov(n, obs_idx)
+
+        sims = self._rng_multivariate_normal(mu_O, Sigma_O, size=B)
+        out = np.empty(B, dtype=float)
+        for b in range(B):
+            out[b] = self._hier_raw_observed_subset(n, obs_idx, sims[b])
+        return out
+
+
+    def _hier_ref_scores_conditional(
+        self,
+        n: int,
+        obs_idx: np.ndarray,
+        y_obs: np.ndarray,
+        target_idx: np.ndarray,
+        B: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Monte Carlo reference distribution for the raw hierarchical *conditional*
+        score on target coordinates given observed coordinates:
+            T_cond(y_U) = inf_u max(
+                ||A_post^{-1/2} u||_2,
+                ||D_U^{-1/2}(y_U - center_U - L_U u)||_inf
+            )
+
+        Simulate Y_U | Y_O=y_obs from the fitted conditional Gaussian law.
+        """
+        obs_idx = np.asarray(obs_idx, dtype=int)
+        target_idx = np.asarray(target_idx, dtype=int)
+
+        if target_idx.size == 0:
+            return np.array([0.0], dtype=float)
+
+        if B is None:
+            B = self.n_mc
+
+        cond_mu, cond_cov = self._conditional_gaussian(
+            n=n,
+            obs_idx=obs_idx,
+            target_idx=target_idx,
+            y_obs=y_obs,
         )
 
-    def score_rows(
+        sims = self._rng_multivariate_normal(cond_mu, cond_cov, size=B)
+        out = np.empty(B, dtype=float)
+        for b in range(B):
+            out[b] = self._hier_raw_conditional(
+                n=n,
+                obs_idx=obs_idx,
+                y_obs=y_obs,
+                target_idx=target_idx,
+                y_target=sims[b],
+            )
+        return out
+    # ------------------------------------------------------------------
+    # Calibration helpers
+    # ------------------------------------------------------------------
+
+    def _draw_pseudo_split(self, obs_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Split observed indices into revealed R and pseudo-hidden H.
+        """
+        obs_idx = np.asarray(obs_idx, dtype=int)
+        m = obs_idx.size
+        if m < 2:
+            raise ValueError("Need at least 2 observed coordinates for pseudo-mask calibration.")
+
+        h = max(self.min_hidden, int(round(self.pseudo_hidden_frac * m)))
+        h = min(h, m - 1)  # leave at least 1 revealed coordinate
+
+        perm = self.rng.permutation(obs_idx)
+        hidden = np.sort(perm[:h])
+        reveal = np.sort(perm[h:])
+        return reveal, hidden
+
+    def _score_for_row(
         self,
-        Y: np.ndarray,
-        M_mask: np.ndarray,
-        row_indices: Optional[Sequence[Tuple[int, int]]] = None,
-        mu: Optional[np.ndarray] = None,
-    ) -> Dict[str, Any]:
-        """
-        Score multiple rows and return arrays/dicts for diagnostics.
-        """
-        if row_indices is None:
-            row_indices = all_nonempty_row_indices(M_mask)
+        n: int,
+        y_row: np.ndarray,
+        obs_mask: np.ndarray,
+    ) -> ScoreRecord:
+        obs_idx = np.flatnonzero(obs_mask)
+        if obs_idx.size == 0:
+            return ScoreRecord(
+                row=n,
+                score=np.nan,
+                raw_score=np.nan,
+                observed_idx=np.array([], dtype=int),
+                target_idx=np.array([], dtype=int),
+            )
 
-        totals = []
-        latents = []
-        idios = []
-        kept_rows = []
+        if self.calibration_mode == "observed":
+            target_idx = np.array([], dtype=int)
 
-        for (i, t) in row_indices:
-            out = self.score_row(Y=Y, M_mask=M_mask, i=i, t=t, mu=mu)
-            if np.isnan(out.total):
-                continue
-            totals.append(out.total)
-            latents.append(out.latent)
-            idios.append(out.idio)
-            kept_rows.append((i, t))
+            if self.score_kind == "mahalanobis":
+                mu_O = self._subset_mean(n, obs_idx)
+                Sigma_O = self._subset_cov(n, obs_idx)
+                raw = self._mahal_raw(y_row[obs_idx], mu_O, Sigma_O)
+                score = chi2.cdf(raw, df=obs_idx.size) if self.use_pit else raw
 
-        dtype = self._dtype()
+            elif self.score_kind == "hierarchical":
+                raw = self._hier_raw_observed_subset(n, obs_idx, y_row[obs_idx])
+                if self.use_pit:
+                    ref = self._hier_ref_scores_observed(n, obs_idx, B=self.n_mc)
+                    score = self._empirical_pit(raw, ref)
+                else:
+                    score = raw
 
-        return {
-            "rows": kept_rows,
-            "total": np.asarray(totals, dtype=dtype),
-            "latent": np.asarray(latents, dtype=dtype),
-            "idio": np.asarray(idios, dtype=dtype),
-        }
+            else:
+                raise ValueError("Unknown score_kind.")
+
+            return ScoreRecord(
+                row=n,
+                score=float(score),
+                raw_score=float(raw),
+                observed_idx=obs_idx,
+                target_idx=target_idx,
+            )
+
+        elif self.calibration_mode == "pseudo_mask":
+            reveal_idx, hidden_idx = self._draw_pseudo_split(obs_idx)
+            y_reveal = y_row[reveal_idx]
+            y_hidden = y_row[hidden_idx]
+
+            if self.score_kind == "mahalanobis":
+                cond_mu, cond_cov = self._conditional_gaussian(
+                    n=n,
+                    obs_idx=reveal_idx,
+                    target_idx=hidden_idx,
+                    y_obs=y_reveal,
+                )
+                raw = self._mahal_raw(y_hidden, cond_mu, cond_cov)
+                score = chi2.cdf(raw, df=hidden_idx.size) if self.use_pit else raw
+
+            elif self.score_kind == "hierarchical":
+                raw = self._hier_raw_conditional(
+                    n=n,
+                    obs_idx=reveal_idx,
+                    y_obs=y_reveal,
+                    target_idx=hidden_idx,
+                    y_target=y_hidden,
+                )
+                if self.use_pit:
+                    ref = self._hier_ref_scores_conditional(
+                        n=n,
+                        obs_idx=reveal_idx,
+                        y_obs=y_reveal,
+                        target_idx=hidden_idx,
+                        B=self.n_mc,
+                    )
+                    score = self._empirical_pit(raw, ref)
+                else:
+                    score = raw
+
+            else:
+                raise ValueError("Unknown score_kind.")
+
+            return ScoreRecord(
+                row=n,
+                score=float(score),
+                raw_score=float(raw),
+                observed_idx=reveal_idx,
+                target_idx=hidden_idx,
+            )
+
+        else:
+            raise ValueError("Unknown calibration_mode.")
+
+    # ------------------------------------------------------------------
+    # Public calibration API
+    # ------------------------------------------------------------------
 
     def calibrate(
         self,
-        Y_cal: np.ndarray,
-        M_cal: np.ndarray,
-        row_indices: Optional[Sequence[Tuple[int, int]]] = None,
-        mu_cal: Optional[np.ndarray] = None,
-        row_weights: Optional[np.ndarray] = None,
+        Y: np.ndarray,
+        M: np.ndarray,
+        calibration_rows: Optional[Sequence[int]] = None,
     ) -> float:
         """
-        Calibrate qhat on row-level calibration data.
-
-        row_weights:
-            optional weights for weighted/localized quantile.
-            If provided, must align with the rows that are actually kept.
-        """
-        scored = self.score_rows(Y=Y_cal, M_mask=M_cal, row_indices=row_indices, mu=mu_cal)
-        scores = scored["total"]
-        rows = scored["rows"]
-
-        if row_weights is None:
-            qhat = higher_quantile(scores, self.alpha)
-        else:
-            row_weights = _as_numpy_array(row_weights, dtype=scores.dtype).reshape(-1)
-            if row_indices is None:
-                if row_weights.size != len(rows):
-                    raise ValueError("row_weights must match the number of kept calibration rows.")
-                weights_kept = row_weights
-            else:
-                if row_weights.size != len(row_indices):
-                    raise ValueError("row_weights must match row_indices length.")
-                # keep only weights corresponding to rows that survived scoring
-                row_to_weight = {tuple(row_indices[k]): row_weights[k] for k in range(len(row_indices))}
-                weights_kept = np.asarray([row_to_weight[(i, t)] for (i, t) in rows], dtype=scores.dtype)
-            qhat = weighted_higher_quantile(scores, weights_kept, self.alpha)
-
-        self.qhat = float(qhat)
-        self.cal_scores_ = scores
-        self.cal_rows_ = rows
-        return self.qhat
-
-    def predict_box_row(
-        self,
-        i: int,
-        t: int,
-        mu_row: np.ndarray,
-        qhat: Optional[float] = None,
-        observed_y: Optional[np.ndarray] = None,
-        observed_mask: Optional[np.ndarray] = None,
-        degenerate_observed: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Conservative channelwise inversion of the hierarchical score.
-
-        If observed_y / observed_mask are provided, we refine the latent factor
-        by conditioning on those observed channels.
-
-        Returned box:
-            center_j +/- q * ( latent_sd_j + idio_sd_j )
-
-        where latent_sd_j = sqrt( L_j A_post L_j^T )
-        and idio_sd_j   = s_i * sqrt(psi_j).
-
-        This is conservative but easy to compute.
-        """
-        self._check_ready()
-        dtype = self._dtype()
-
-        if qhat is None:
-            if self.qhat is None:
-                raise RuntimeError("No qhat stored. Call calibrate(...) or pass qhat explicitly.")
-            q = dtype.type(self.qhat)
-        else:
-            q = dtype.type(qhat)
-
-        mu_row = _as_numpy_array(mu_row, dtype=dtype)
-
-        if observed_y is None or observed_mask is None:
-            f_post = np.zeros(self.L.shape[1], dtype=dtype)
-            A_post = self._row_prior_cov(i, t)
-            obs_idx = np.empty(0, dtype=int)
-            observed_y = None
-            observed_mask = None
-        else:
-            observed_y = _as_numpy_array(observed_y, dtype=dtype)
-            observed_mask = _as_numpy_array(observed_mask, dtype=bool)
-            obs_idx = np.flatnonzero(observed_mask)
-            residual_obs = (observed_y - mu_row)[obs_idx]
-            f_post, A_post = self._posterior_factor_given_obs(
-                i=i, t=t, residual_obs=residual_obs, obs_idx=obs_idx
-            )
-
-        # predictive center = mean + latent posterior mean contribution
-        latent_center = self.L @ f_post
-        center = mu_row + latent_center
-
-        # channelwise latent uncertainty after conditioning
-        LA = self.L @ A_post
-        latent_var = np.clip(np.sum(LA * self.L, axis=1), 0.0, None)
-        latent_sd = np.sqrt(latent_var)
-
-        # channelwise idiosyncratic uncertainty
-        idio_sd = self.s[i] * np.sqrt(np.clip(self.psi, self.eps, None))
-
-        half_width = q * (latent_sd + idio_sd)
-        lower = center - half_width
-        upper = center + half_width
-
-        if degenerate_observed and observed_y is not None and observed_mask is not None and obs_idx.size > 0:
-            lower = lower.copy()
-            upper = upper.copy()
-            lower[obs_idx] = observed_y[obs_idx]
-            upper[obs_idx] = observed_y[obs_idx]
-
-        aux = {
-            "center": center,
-            "half_width": half_width,
-            "latent_center": latent_center,
-            "latent_sd": latent_sd,
-            "idio_sd": idio_sd,
-            "f_post": f_post,
-            "A_post": A_post,
-        }
-        return lower, upper, aux
-
-    def predict_box_dataset(
-        self,
-        row_indices: Sequence[Tuple[int, int]],
-        mu: np.ndarray,
-        qhat: Optional[float] = None,
-        observed_Y: Optional[np.ndarray] = None,
-        observed_M: Optional[np.ndarray] = None,
-        degenerate_observed: bool = True,
-    ) -> Dict[Tuple[int, int], Dict[str, np.ndarray]]:
-        """
-        Batch wrapper around predict_box_row.
-        """
-        out: Dict[Tuple[int, int], Dict[str, np.ndarray]] = {}
-        for (i, t) in row_indices:
-            mu_row = mu[i, t]
-            if observed_Y is None or observed_M is None:
-                lower, upper, aux = self.predict_box_row(
-                    i=i,
-                    t=t,
-                    mu_row=mu_row,
-                    qhat=qhat,
-                    observed_y=None,
-                    observed_mask=None,
-                    degenerate_observed=degenerate_observed,
-                )
-            else:
-                lower, upper, aux = self.predict_box_row(
-                    i=i,
-                    t=t,
-                    mu_row=mu_row,
-                    qhat=qhat,
-                    observed_y=observed_Y[i, t],
-                    observed_mask=observed_M[i, t],
-                    degenerate_observed=degenerate_observed,
-                )
-            out[(i, t)] = {
-                "lower": lower,
-                "upper": upper,
-                **aux,
-            }
-        return out
-
-    # ---------------------------
-    # New exact-region utilities
-    # ---------------------------
-
-    def _row_full_region_mats(
-        self,
-        i: int,
-        t: int,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Build the exact-region matrices for a single row (i,t), assuming the
-        candidate row is fully specified (with some coordinates possibly fixed).
-
-        Model:
-            r = y - mu
-            f_hat(r) = A L^T Sigma^{-1} r
-            eps_hat(r) = r - L f_hat(r) = D Sigma^{-1} r
-
-        Then
-            S_lat(r)^2 = r^T B r
-            S_idio(r)  = || C r ||_inf
-
-        where
-            Sigma = L A L^T + D
-            B     = Sigma^{-1} L A L^T Sigma^{-1}
-            C     = D^{1/2} Sigma^{-1}
-        """
-        self._check_ready()
-
-        J, r = self.L.shape
-
-        A = self._row_prior_cov(i, t)          # (r, r)
-        d_diag = self._row_idio_diag(i)        # (J,)
-        D = np.diag(d_diag)                    # (J, J)
-
-        Ij = np.eye(J)
-
-        LA = self.L @ A                        # (J, r)
-        Sigma = LA @ self.L.T + D
-        Sigma = 0.5 * (Sigma + Sigma.T) + self.jitter * Ij
-        Sigma_inv = np.linalg.inv(Sigma)
-
-        K = LA @ self.L.T                      # = L A L^T
-        B = Sigma_inv @ K @ Sigma_inv
-        B = 0.5 * (B + B.T)
-
-        D_half = np.diag(np.sqrt(np.clip(d_diag, a_min=self.eps, a_max=None)))
-        C = D_half @ Sigma_inv
-
-        return {
-            "A": A,
-            "D": D,
-            "d_diag": d_diag,
-            "Sigma": Sigma,
-            "Sigma_inv": Sigma_inv,
-            "B": B,
-            "C": C,
-        }
-
-    def exact_region_score_row(
-        self,
-        i: int,
-        t: int,
-        y_row: np.ndarray,
-        mu_row: np.ndarray,
-        observed_y: Optional[np.ndarray] = None,
-        observed_mask: Optional[np.ndarray] = None,
-        enforce_observed_match: bool = True,
-        atol: float = 1e-8,
-    ) -> ExactRegionScore:
-        """
-        Evaluate the *exact* hierarchical score for a fully specified candidate row.
+        Calibrate qhat from partially observed rows.
 
         Parameters
         ----------
-        i, t:
-            Row index.
-        y_row:
-            Candidate full row, shape (J,).
-        mu_row:
-            Mean row, shape (J,).
-        observed_y, observed_mask:
-            Optional already-observed coordinates. If provided and
-            enforce_observed_match=True, y_row must match them on observed coords.
+        Y : array, shape (..., J)
+            Outcomes / residual rows.
+        M : array, shape (..., J), bool
+            Observation mask, True = observed.
+        calibration_rows : sequence of row indices or None
+            If None, use all rows.
         """
-        self._check_ready()
+        Y = _flatten_rows_lastdim(np.asarray(Y, dtype=float))
+        M = _flatten_rows_lastdim(np.asarray(M, dtype=bool))
 
-        y_row = np.asarray(y_row, dtype=float).reshape(-1)
-        mu_row = np.asarray(mu_row, dtype=float).reshape(-1)
+        if Y.shape != (self.N, self.J):
+            raise ValueError("Y shape incompatible with mu.")
+        if M.shape != (self.N, self.J):
+            raise ValueError("M shape incompatible with mu.")
 
-        if observed_y is not None and observed_mask is not None and enforce_observed_match:
-            observed_y = np.asarray(observed_y, dtype=float).reshape(-1)
-            observed_mask = np.asarray(observed_mask, dtype=bool).reshape(-1)
-            obs_idx = np.nonzero(observed_mask)[0]
-            if obs_idx.size > 0:
-                diff = np.abs(y_row[obs_idx] - observed_y[obs_idx])
-                if np.any(diff > atol):
-                    raise ValueError("y_row does not match observed_y on observed coordinates.")
+        rows = np.arange(self.N) if calibration_rows is None else np.asarray(calibration_rows, dtype=int)
 
-        mats = self._row_full_region_mats(i=i, t=t)
-        A = mats["A"]
-        Sigma_inv = mats["Sigma_inv"]
-        B = mats["B"]
-        C = mats["C"]
+        records: List[ScoreRecord] = []
+        scores: List[float] = []
 
-        r = y_row - mu_row
+        for n in rows:
+            try:
+                rec = self._score_for_row(n, Y[n], M[n])
+            except ValueError:
+                # e.g. pseudo-mask row with <2 observed coords; skip
+                continue
 
-        f_post_full = A @ self.L.T @ Sigma_inv @ r
-        eps_hat_full = r - self.L @ f_post_full
+            if np.isfinite(rec.score):
+                records.append(rec)
+                scores.append(rec.score)
 
-        latent_score_sq = max(r @ (B @ r), 0.0)
-        latent_score = np.sqrt(latent_score_sq)
+        if len(scores) == 0:
+            raise ValueError("No finite calibration scores were produced.")
 
-        idio_vec = C @ r
-        idio_score = np.max(np.abs(idio_vec))
+        self.qhat_ = _higher_quantile(np.asarray(scores, dtype=float), self.alpha)
+        self.calibration_scores_ = np.asarray(scores, dtype=float)
+        self.calibration_records_ = records
+        return self.qhat_
 
-        total = max(latent_score, idio_score)
+    # ------------------------------------------------------------------
+    # Candidate scoring at test time
+    # ------------------------------------------------------------------
 
-        return ExactRegionScore(
-            total=float(total),
-            latent=float(latent_score),
-            idio=float(idio_score),
-            r=r,
-            f_post_full=f_post_full,
-            eps_hat_full=eps_hat_full,
-        )
-
-    def in_exact_region_row(
+    def score_candidate(
         self,
-        i: int,
-        t: int,
+        n: int,
         y_row: np.ndarray,
-        mu_row: np.ndarray,
-        qhat: Optional[float] = None,
-        observed_y: Optional[np.ndarray] = None,
-        observed_mask: Optional[np.ndarray] = None,
-        atol: float = 1e-8,
-    ) -> bool:
+        obs_mask: np.ndarray,
+    ) -> float:
         """
-        Check whether a candidate full row belongs to the exact score-threshold region.
+        Score a full row in 'observed' mode, or a row with target coordinates in
+        'pseudo_mask' mode if you provide a mask where False entries are treated
+        as targets and True entries as revealed.
+
+        In deployment for missing-coordinate prediction, use predict_row() instead.
         """
-        if qhat is None:
-            if self.qhat is None:
-                raise RuntimeError("No qhat stored. Call calibrate(...) or pass qhat explicitly.")
-            q = float(self.qhat)
-        else:
-            q = float(qhat)
+        y_row = np.asarray(y_row, dtype=float).reshape(-1)
+        obs_mask = np.asarray(obs_mask, dtype=bool).reshape(-1)
+        rec = self._score_for_row(n, y_row, obs_mask)
+        return rec.score
 
-        s = self.exact_region_score_row(
-            i=i,
-            t=t,
-            y_row=y_row,
-            mu_row=mu_row,
-            observed_y=observed_y,
-            observed_mask=observed_mask,
-            enforce_observed_match=True,
-            atol=atol,
-        )
-        return bool(s.total <= q + atol)
+    # ------------------------------------------------------------------
+    # Prediction for missing coordinates
+    # ------------------------------------------------------------------
 
-    # -------------------------------------------------------------
-    # CVXPY exact region + coordinate projection
-    # -------------------------------------------------------------
+    def _require_calibrated(self) -> None:
+        if self.qhat_ is None:
+            raise RuntimeError("Call calibrate(...) first.")
 
-    def _build_exact_region_cvxpy_problem(
+    def predict_row(
         self,
-        i: int,
-        t: int,
-        mu_row: np.ndarray,
-        qhat: Optional[float] = None,
-        observed_y: Optional[np.ndarray] = None,
-        observed_mask: Optional[np.ndarray] = None,
-        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    ):
+        n: int,
+        y_obs_row: np.ndarray,
+        obs_mask: np.ndarray,
+        *,
+        target_idx: Optional[Sequence[int]] = None,
+        exact_hierarchical: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Build a CVXPY feasibility description of the exact conformal region:
+        Build a model-based/asymptotic prediction object for the missing coordinates.
 
-            { y :
-                (y-mu)^T B (y-mu) <= q^2,
-                |C (y-mu)| <= q,
-                y_obs fixed on observed coordinates
-            }
+        Parameters
+        ----------
+        n : int
+            Row index.
+        y_obs_row : array, shape (J,)
+            Row with observed values in the observed entries. Unobserved entries
+            can contain anything; they are ignored.
+        obs_mask : array, shape (J,), bool
+            True = observed.
+        target_idx : sequence or None
+            If None, targets are the missing coordinates (~obs_mask).
+        exact_hierarchical : bool
+            If True and score_kind='hierarchical', compute exact coordinate
+            projections using CVXPY. If False, return conservative intervals.
 
         Returns
         -------
-        y_var : cp.Variable shape (J,)
-        constraints : list
-        meta : dict with indices and matrices
+        dict with keys depending on score_kind
         """
-        try:
-            import cvxpy as cp
-        except ImportError as e:
-            raise ImportError(
-                "This exact-region projection code requires cvxpy. "
-                "Install it with `pip install cvxpy`."
-            ) from e
+        self._require_calibrated()
 
-        self._check_ready()
+        y_obs_row = np.asarray(y_obs_row, dtype=float).reshape(-1)
+        obs_mask = np.asarray(obs_mask, dtype=bool).reshape(-1)
 
-        if qhat is None:
-            if self.qhat is None:
-                raise RuntimeError("No qhat stored. Call calibrate(...) or pass qhat explicitly.")
-            q = float(self.qhat)
-        else:
-            q = float(qhat)
-
-        mu_np = np.asarray(mu_row, dtype=float).reshape(-1)
-        J = mu_np.size
-
-        mats = self._row_full_region_mats(i=i, t=t)
-        B = mats["B"]
-        C = mats["C"]
-
-        B = 0.5 * (B + B.T)
-        F = _psd_sqrt_factor_numpy(B)
-
-        y_var = cp.Variable(J)
-        r_expr = y_var - mu_np
-
-        constraints = [
-        cp.sum_squares(F @ r_expr) <= q ** 2,
-        C @ r_expr <= q,
-        -(C @ r_expr) <= q,
-    ]
-
-        obs_idx = np.array([], dtype=int)
-        tgt_idx = np.arange(J, dtype=int)
-
-        if observed_y is not None and observed_mask is not None:
-            observed_y = np.asarray(observed_y, dtype=float).reshape(-1)
-            observed_mask = np.asarray(observed_mask, dtype=bool).reshape(-1)
-
-            obs_idx = np.nonzero(observed_mask)[0].astype(int)
-            tgt_idx = np.nonzero(~observed_mask)[0].astype(int)
-
-            if obs_idx.size > 0:
-                constraints.append(y_var[obs_idx] == observed_y[obs_idx])
-
-        if extra_bounds is not None:
-            lo, hi = extra_bounds
-            if lo is not None:
-                constraints.append(y_var >= np.asarray(lo, dtype=float).reshape(-1))
-            if hi is not None:
-                constraints.append(y_var <= np.asarray(hi, dtype=float).reshape(-1))
-
-        meta = {
-            "q": q,
-            "mu": mu_np,
-            "B": B,
-            "C": C,
-            "obs_idx": obs_idx,
-            "tgt_idx": tgt_idx,
-        }
-        return y_var, constraints, meta
-
-    def exact_project_channel_interval_row(
-        self,
-        i: int,
-        t: int,
-        j: int,
-        mu_row: np.ndarray,
-        qhat: Optional[float] = None,
-        observed_y: Optional[np.ndarray] = None,
-        observed_mask: Optional[np.ndarray] = None,
-        solver: Optional[str] = None,
-        solver_opts: Optional[Dict[str, Any]] = None,
-        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        atol: float = 1e-7,
-    ) -> Tuple[float, float, Dict[str, Any]]:
-        """
-        Compute the exact coordinate projection interval for channel j:
-
-            [ min y_j : y in exact region,   max y_j : y in exact region ]
-
-        If channel j is already observed and observed_mask is provided, this returns the
-        degenerate interval [observed_y[j], observed_y[j]].
-        """
-        try:
-            import cvxpy as cp
-        except ImportError as e:
-            raise ImportError(
-                "This exact-region projection code requires cvxpy. "
-                "Install it with `pip install cvxpy`."
-            ) from e
-
-        self._check_ready()
-
-        if solver is None:
-            solver = "SCS"
-        if solver_opts is None:
-            solver_opts = {"verbose": False}
-
-        mu_row = np.asarray(mu_row, dtype=float).reshape(-1)
-        J = mu_row.size
-        if not (0 <= j < J):
-            raise IndexError(f"j={j} out of bounds for J={J}")
-
-        if observed_y is not None and observed_mask is not None:
-            observed_mask_arr = np.asarray(observed_mask, dtype=bool).reshape(-1)
-            if observed_mask_arr[j]:
-                obs_val = float(np.asarray(observed_y, dtype=float).reshape(-1)[j])
-                return obs_val, obs_val, {
-                    "status_min": "fixed_observed",
-                    "status_max": "fixed_observed",
-                    "is_observed": True,
-                }
-
-        y_var, constraints, meta = self._build_exact_region_cvxpy_problem(
-            i=i,
-            t=t,
-            mu_row=mu_row,
-            qhat=qhat,
-            observed_y=observed_y,
-            observed_mask=observed_mask,
-            extra_bounds=extra_bounds,
-        )
-
-        prob_min = cp.Problem(cp.Minimize(y_var[j]), constraints)
-        prob_max = cp.Problem(cp.Maximize(y_var[j]), constraints)
-
-        prob_min.solve(solver=solver, **solver_opts)
-        status_min = prob_min.status
-        if status_min not in ("optimal", "optimal_inaccurate"):
-            raise RuntimeError(f"Minimization for subject {i}, time {t}, channel {j} failed with status={status_min}")
-
-        lo = float(y_var.value[j])
-
-        prob_max.solve(solver=solver, **solver_opts)
-        status_max = prob_max.status
-        if status_max not in ("optimal", "optimal_inaccurate"):
-            raise RuntimeError(f"Maximization for subject {i}, time {t}, channel {j} failed with status={status_max}")
-
-        hi = float(y_var.value[j])
-
-        if hi < lo and hi >= lo - atol:
-            hi = lo
-
-        return lo, hi, {
-            "status_min": status_min,
-            "status_max": status_max,
-            "is_observed": False,
-            "q": meta["q"],
-        }
-
-    def exact_project_intervals_row(
-        self,
-        i: int,
-        t: int,
-        mu_row: np.ndarray,
-        qhat: Optional[float] = None,
-        observed_y: Optional[np.ndarray] = None,
-        observed_mask: Optional[np.ndarray] = None,
-        target_idx: Optional[Sequence[int]] = None,
-        solver: Optional[str] = None,
-        solver_opts: Optional[Dict[str, Any]] = None,
-        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        fill_observed: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-        """
-        Compute exact coordinate-projection intervals for a whole row.
-
-        Parameters
-        ----------
-        target_idx:
-            Optional subset of channels to project. If None:
-              - if observed_mask is given, project the unobserved channels;
-              - otherwise, project all channels.
-        fill_observed:
-            If True and observed channels exist, fill them as degenerate intervals
-            at the observed values in the returned lower/upper arrays.
-        """
-        self._check_ready()
-
-        mu_row = np.asarray(mu_row, dtype=float).reshape(-1)
-        J = mu_row.size
-
+        obs_idx = np.flatnonzero(obs_mask)
         if target_idx is None:
-            if observed_mask is None:
-                target_idx_list = list(range(J))
-            else:
-                observed_mask_arr = np.asarray(observed_mask, dtype=bool).reshape(-1)
-                target_idx_list = [j for j in range(J) if not observed_mask_arr[j]]
+            tgt_idx = np.flatnonzero(~obs_mask)
         else:
-            target_idx_list = [int(j) for j in target_idx]
+            tgt_idx = np.asarray(target_idx, dtype=int)
 
-        lower = np.full(J, np.nan)
-        upper = np.full(J, np.nan)
-        per_channel: Dict[int, Dict[str, Any]] = {}
+        if tgt_idx.size == 0:
+            return {
+                "row": n,
+                "target_idx": tgt_idx,
+                "center": np.empty(0, dtype=float),
+                "lower": np.empty(0, dtype=float),
+                "upper": np.empty(0, dtype=float),
+                "qhat": self.qhat_,
+            }
 
-        if fill_observed and observed_y is not None and observed_mask is not None:
-            observed_y_arr = np.asarray(observed_y, dtype=float).reshape(-1)
-            observed_mask_arr = np.asarray(observed_mask, dtype=bool).reshape(-1)
-            obs_idx = np.nonzero(observed_mask_arr)[0]
-            if obs_idx.size > 0:
-                lower[obs_idx] = observed_y_arr[obs_idx]
-                upper[obs_idx] = observed_y_arr[obs_idx]
-
-        for j in target_idx_list:
-            lo, hi, info = self.exact_project_channel_interval_row(
-                i=i,
-                t=t,
-                j=j,
-                mu_row=mu_row,
-                qhat=qhat,
-                observed_y=observed_y,
-                observed_mask=observed_mask,
-                solver=solver,
-                solver_opts=solver_opts,
-                extra_bounds=extra_bounds,
+        if self.score_kind == "mahalanobis":
+            cond_mu, cond_cov = self._conditional_gaussian(
+                n=n,
+                obs_idx=obs_idx,
+                target_idx=tgt_idx,
+                y_obs=y_obs_row[obs_idx],
             )
-            lower[j] = lo
-            upper[j] = hi
-            per_channel[j] = info
+            raw_thr = chi2.ppf(self.qhat_, df=tgt_idx.size) if self.use_pit else self.qhat_
+            raw_thr = max(float(raw_thr), 0.0)
 
-        aux = {
-            "target_idx": target_idx_list,
-            "per_channel": per_channel,
-        }
-        return lower, upper, aux
+            # Exact coordinate projection of ellipsoid:
+            # [mu_j ± sqrt(raw_thr * Sigma_jj)]
+            sd = np.sqrt(np.clip(np.diag(cond_cov), self.jitter, None))
+            half = np.sqrt(raw_thr) * sd
+            lower = cond_mu - half
+            upper = cond_mu + half
 
-    def predict_exact_projected_row(
+            return {
+                "row": n,
+                "target_idx": tgt_idx,
+                "center": cond_mu,
+                "cov": cond_cov,
+                "raw_threshold": raw_thr,
+                "lower": lower,
+                "upper": upper,
+                "qhat": self.qhat_,
+            }
+
+        if self.score_kind == "hierarchical":
+            m_post, A_post = self._posterior_latent_from_obs(
+                n=n,
+                obs_idx=obs_idx,
+                y_obs=y_obs_row[obs_idx],
+            )
+
+            L_U = self.L[tgt_idx]
+            mu_U = self.mu[n, tgt_idx]
+            dU = np.sqrt(self._row_D_diag(n)[tgt_idx])
+
+            center = mu_U + L_U @ m_post
+            if self.use_pit:
+                ref = self._hier_ref_scores_conditional(
+                    n=n,
+                    obs_idx=obs_idx,
+                    y_obs=y_obs_row[obs_idx],
+                    target_idx=tgt_idx,
+                    B=self.n_mc,
+                )
+                raw_thr = self._empirical_ppf(self.qhat_, ref)
+            else:
+                raw_thr = float(self.qhat_)
+
+            if exact_hierarchical:
+                lower, upper = self._hierarchical_exact_project(
+                    n=n,
+                    center=center,
+                    A_post=A_post,
+                    L_U=L_U,
+                    dU=dU,
+                    raw_thr=raw_thr,
+                )
+            else:
+                # Conservative outer bound
+                latent_sd = np.sqrt(np.clip(np.sum((L_U @ A_post) * L_U, axis=1), self.jitter, None))
+                half = raw_thr * (latent_sd + dU)
+                lower = center - half
+                upper = center + half
+
+            return {
+                "row": n,
+                "target_idx": tgt_idx,
+                "center": center,
+                "A_post": A_post,
+                "raw_threshold": raw_thr,
+                "lower": lower,
+                "upper": upper,
+                "qhat": self.qhat_,
+            }
+
+        raise ValueError("Unknown score_kind.")
+
+    def _hierarchical_exact_project(
         self,
-        i: int,
-        t: int,
-        mu_row: np.ndarray,
-        qhat: Optional[float] = None,
-        observed_y: Optional[np.ndarray] = None,
-        observed_mask: Optional[np.ndarray] = None,
-        target_idx: Optional[Sequence[int]] = None,
-        solver: Optional[str] = None,
-        solver_opts: Optional[Dict[str, Any]] = None,
-        extra_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        fill_observed: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        n: int,
+        center: np.ndarray,
+        A_post: np.ndarray,
+        L_U: np.ndarray,
+        dU: np.ndarray,
+        raw_thr: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Convenience wrapper: exact coordinate projections of the exact conformal region.
+        Exact coordinate projections for the hierarchical conditional region:
 
-        This is the direct replacement for the old conservative `predict_box_row`.
+            exists u s.t.
+                || A_post^{-1/2} u ||_2 <= raw_thr
+                | y_U - center - L_U u | <= raw_thr * dU
+
+        One SOCP solve per target coordinate endpoint.
         """
-        lower, upper, aux = self.exact_project_intervals_row(
-            i=i,
-            t=t,
-            mu_row=mu_row,
-            qhat=qhat,
-            observed_y=observed_y,
-            observed_mask=observed_mask,
-            target_idx=target_idx,
-            solver=solver,
-            solver_opts=solver_opts,
-            extra_bounds=extra_bounds,
-            fill_observed=fill_observed,
-        )
-        return lower, upper, aux
+        try:
+            import cvxpy as cp
+        except ImportError as e:
+            raise ImportError(
+                "Exact hierarchical projections require cvxpy. "
+                "Install it with `pip install cvxpy`."
+            ) from e
 
-# ---------------------------------------------------------------------
-# Example usage in your current pipeline
-# ---------------------------------------------------------------------
-#
-# 1) Fit your factor model on residual tensor Y_resid_train-like data.
-#    If you are using zero-mean innovations in the simulation, mu_full can be zeros.
-#
-#    em_out = run_em_like(
-#        Y_resid_full,      # (I,T,J) residual tensor for the rows you want a2 on
-#        M_mask_full,       # (I,T,J) bool mask
-#        r=r,
-#        M_ctrl=M_ctrl,
-#        degree=degree,
-#        device=device,
-#        use_woodbury=True,
-#        return_history=True,
-#    )
-#
-# 2) Wrap the fitted params.
-#
-#    hfcp = HierarchicalFactorSplitCP.from_run_em_like(em_out, alpha=0.1)
-#
-# 3) Build row-level calibration indices.
-#    Strongly preferred: split at row level from the start.
-#    If you only have old flat indices k=i*(J*T)+j*T+t, convert them:
-#
-#    cal_rows = unique_row_indices_from_flat_ijt(cal_idx_flat, J=J, T=T)
-#
-# 4) Calibrate:
-#
-#    mu_full = np.zeros_like(Y_resid_full)      # or your fitted mean tensor
-#    qhat = hfcp.calibrate(
-#        Y_cal=Y_resid_full,
-#        M_cal=M_mask_full,
-#        row_indices=cal_rows,
-#        mu_cal=mu_full,
-#    )
-#
-# 5) Predict a conservative box for a test row (i,t).
-#    If nothing is observed at test time yet:
-#
-#    lower, upper, aux = hfcp.predict_box_row(
-#        i=i_test,
-#        t=t_test,
-#        mu_row=mu_full[i_test, t_test],
-#        qhat=qhat,
-#    )
-#
-# 6) If some channels are already observed and you want refinement:
-#
-#    lower_ref, upper_ref, aux_ref = hfcp.predict_box_row(
-#        i=i_test,
-#        t=t_test,
-#        mu_row=mu_full[i_test, t_test],
-#        qhat=qhat,
-#        observed_y=Y_resid_full[i_test, t_test],   # or true partially revealed row
-#        observed_mask=M_mask_full[i_test, t_test], # mask of revealed channels
-#        degenerate_observed=True,
-#    )
-#
+        center = np.asarray(center, dtype=float)
+        L_U = np.asarray(L_U, dtype=float)
+        dU = np.asarray(dU, dtype=float)
+
+        p = center.size
+        r = A_post.shape[0]
+
+        A_post_inv = _safe_inv_spd(A_post, jitter=self.jitter)
+        F = _psd_sqrt_factor_numpy(A_post_inv)
+
+        lower = np.full(p, np.nan, dtype=float)
+        upper = np.full(p, np.nan, dtype=float)
+
+        for j in range(p):
+            y = cp.Variable(p)
+            u = cp.Variable(r)
+
+            resid = y - center - L_U @ u
+            constraints = [
+                cp.norm(F @ u, 2) <= raw_thr,
+                resid <= raw_thr * dU,
+                -resid <= raw_thr * dU,
+            ]
+
+            prob_lo = cp.Problem(cp.Minimize(y[j]), constraints)
+            prob_lo.solve(solver=self.solver, **self.solver_opts)
+            if prob_lo.status not in ("optimal", "optimal_inaccurate"):
+                raise RuntimeError(
+                    f"Hierarchical exact lower projection failed at row {n}, "
+                    f"target position {j}, status={prob_lo.status}"
+                )
+            lower[j] = float(y.value[j])
+
+            prob_hi = cp.Problem(cp.Maximize(y[j]), constraints)
+            prob_hi.solve(solver=self.solver, **self.solver_opts)
+            if prob_hi.status not in ("optimal", "optimal_inaccurate"):
+                raise RuntimeError(
+                    f"Hierarchical exact upper projection failed at row {n}, "
+                    f"target position {j}, status={prob_hi.status}"
+                )
+            upper[j] = float(y.value[j])
+
+        return lower, upper

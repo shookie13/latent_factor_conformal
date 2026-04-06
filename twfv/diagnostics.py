@@ -256,6 +256,38 @@ def conformal_scaled_abs(
     return lower, upper, float(q)
 
 
+def _to_numpy_safe(x: Any) -> Any:
+    if isinstance(x, np.ndarray):
+        return x
+    if hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
+        return x.detach().cpu().numpy()
+    return np.asarray(x) if np.isscalar(x) or hasattr(x, "__array__") else x
+
+
+def _extract_em_factor_params(em_result: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if isinstance(em_result, dict):
+        try:
+            L = _to_numpy_safe(em_result["L"])
+            a2 = _to_numpy_safe(em_result["a2"])
+            psi = _to_numpy_safe(em_result["psi"])
+            s = _to_numpy_safe(em_result["s"])
+        except KeyError as e:
+            raise ValueError("decomp em_result dict must contain keys 'L', 'a2', 'psi', and 's'.") from e
+    elif isinstance(em_result, (list, tuple)):
+        if len(em_result) < 4:
+            raise ValueError("decomp em_result sequence must start with (L, a2, psi, s, ...).")
+        L, a2, psi, s = (_to_numpy_safe(em_result[k]) for k in range(4))
+    else:
+        raise ValueError("decomp em_result must be a dict, list, or tuple.")
+
+    return (
+        np.asarray(L, dtype=float),
+        np.asarray(a2, dtype=float),
+        np.asarray(psi, dtype=float),
+        np.asarray(s, dtype=float),
+    )
+
+
 def _normalize_resample_methods(methods: Optional[Sequence[str]]) -> List[str]:
     if methods is None:
         methods = ("tmfv", "oracle", "avg")
@@ -418,7 +450,7 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
         cqr_random_state_base = int(cqr_kwargs.pop("random_state_base", 0))
 
     if "decomp" in methods_use:
-        from twfv.decomp import HierarchicalFactorSplitCP, unique_row_indices_from_flat_ijt
+        from twfv.decomp import PartialOutputConformalCP
 
         decomp_kwargs = dict(method_kwargs.get("decomp", {}))
         if "em_result" not in decomp_kwargs:
@@ -657,62 +689,99 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
             decomp_cfg = dict(decomp_kwargs)
             em_result = decomp_cfg.pop("em_result")
             decomp_alpha = float(decomp_cfg.pop("alpha", alpha))
-            mu_full = np.asarray(decomp_cfg.pop("mu_full", np.zeros_like(Y)), dtype=float)
-            degenerate_observed = bool(decomp_cfg.pop("degenerate_observed", True))
-            row_weights = decomp_cfg.pop("row_weights", None)
-
-            hfcp = HierarchicalFactorSplitCP.from_run_em_like(
-                em_result,
-                alpha=decomp_alpha,
-                **decomp_cfg,
+            mu_rows = np.asarray(
+                decomp_cfg.pop("mu_rows", np.zeros((I, T, J), dtype=float)),
+                dtype=float,
+            ).reshape(-1, J)
+            score_kind = str(decomp_cfg.pop("score_kind", "hierarchical"))
+            calibration_mode = str(decomp_cfg.pop("calibration_mode", "pseudo_mask"))
+            use_pit = bool(decomp_cfg.pop("use_pit", False))
+            pseudo_hidden_frac = float(decomp_cfg.pop("pseudo_hidden_frac", 0.3))
+            min_hidden = int(decomp_cfg.pop("min_hidden", 1))
+            n_mc = int(decomp_cfg.pop("n_mc", 1000))
+            random_state = decomp_cfg.pop("random_state", 0)
+            jitter = float(decomp_cfg.pop("jitter", 1e-8))
+            solver = str(decomp_cfg.pop("solver", "SCS"))
+            solver_opts = decomp_cfg.pop(
+                "solver_opts",
+                {"verbose": False, "eps": 1e-5, "max_iters": 20000},
             )
-            cal_rows = unique_row_indices_from_flat_ijt(cal_idx, J=J, T=T)
+            exact_hierarchical = bool(decomp_cfg.pop("exact_hierarchical", False))
+            if decomp_cfg:
+                unknown = ", ".join(sorted(decomp_cfg.keys()))
+                raise ValueError(f"Unknown method_kwargs['decomp'] keys: {unknown}")
+
+            L, a2, psi, s = _extract_em_factor_params(em_result)
+            A_rows = a2.reshape(-1, a2.shape[-1])
+            D_diag_rows = np.repeat((s ** 2), repeats=T)[:, None] * psi[None, :]
+            Y_rows = Y.reshape(-1, J)
+
             flat_cal_mask = np.zeros(I * J * T, dtype=bool)
             flat_cal_mask[np.asarray(cal_idx, dtype=int).ravel()] = True
-            M_cal = flat_cal_mask.reshape(I, J, T).transpose(0, 2, 1)
-            q_decomp = hfcp.calibrate(
-                Y_cal=Y,
-                M_cal=M_cal,
-                row_indices=cal_rows,
-                mu_cal=mu_full,
-                row_weights=row_weights,
+            M_cal_rows = flat_cal_mask.reshape(I, J, T).transpose(0, 2, 1).reshape(-1, J)
+            cal_row_idx = np.unique((np.asarray(cal_idx, dtype=int).ravel() // (J * T)) * T + (np.asarray(cal_idx, dtype=int).ravel() % T))
+
+            cp_hier = PartialOutputConformalCP(
+                mu=mu_rows,
+                L=L,
+                A_diag=A_rows,
+                D_diag=D_diag_rows,
+                alpha=decomp_alpha,
+                score_kind=score_kind,
+                calibration_mode=calibration_mode,
+                use_pit=use_pit,
+                pseudo_hidden_frac=pseudo_hidden_frac,
+                min_hidden=min_hidden,
+                n_mc=n_mc,
+                random_state=random_state,
+                jitter=jitter,
+                solver=solver,
+                solver_opts=solver_opts,
+            )
+            q_decomp = cp_hier.calibrate(
+                Y_rows,
+                M_cal_rows,
+                calibration_rows=cal_row_idx,
             )
 
             flat_test_mask = np.zeros(I * J * T, dtype=bool)
             flat_test_mask[test_idx] = True
-            M_test = flat_test_mask.reshape(I, J, T).transpose(0, 2, 1)
+            M_test_rows = (~flat_test_mask.reshape(I, J, T).transpose(0, 2, 1)).reshape(-1, J)
 
             lower_decomp = np.full(test_idx.shape[0], np.nan, dtype=float)
             upper_decomp = np.full(test_idx.shape[0], np.nan, dtype=float)
-            row_aux: Dict[Tuple[int, int], Dict[str, Any]] = {}
+            row_aux: Dict[int, Dict[str, Any]] = {}
 
-            row_to_positions: Dict[Tuple[int, int], List[int]] = {}
+            row_to_positions: Dict[int, List[int]] = {}
+            row_to_channels: Dict[int, List[int]] = {}
             for pos, k in enumerate(test_idx.tolist()):
                 i = int(k // (J * T))
                 rem = int(k % (J * T))
                 j = int(rem // T)
                 t = int(rem % T)
-                row_to_positions.setdefault((i, t), []).append(pos)
-                row_aux.setdefault((i, t), {"channels": []})
-                row_aux[(i, t)]["channels"].append(j)
+                row_idx = i * T + t
+                row_to_positions.setdefault(row_idx, []).append(pos)
+                row_to_channels.setdefault(row_idx, []).append(j)
 
-            for (i, t), positions in row_to_positions.items():
-                observed_mask = ~M_test[i, t]
-                observed_y = Y[i, t, :]
-                lower_row, upper_row, aux_row = hfcp.predict_box_row(
-                    i=i,
-                    t=t,
-                    mu_row=mu_full[i, t],
-                    qhat=q_decomp,
-                    observed_y=observed_y,
-                    observed_mask=observed_mask,
-                    degenerate_observed=degenerate_observed,
+            for row_idx, positions in row_to_positions.items():
+                target_idx_row = np.asarray(sorted(set(row_to_channels[row_idx])), dtype=int)
+                pred_hier = cp_hier.predict_row(
+                    n=row_idx,
+                    y_obs_row=Y_rows[row_idx],
+                    obs_mask=M_test_rows[row_idx],
+                    target_idx=target_idx_row,
+                    exact_hierarchical=exact_hierarchical,
                 )
+                chan_to_offset = {int(ch): idx for idx, ch in enumerate(target_idx_row.tolist())}
                 for pos in positions:
                     chan = int(chan_test[pos])
-                    lower_decomp[pos] = float(lower_row[chan])
-                    upper_decomp[pos] = float(upper_row[chan])
-                row_aux[(i, t)].update(aux_row=aux_row)
+                    offset = chan_to_offset[chan]
+                    lower_decomp[pos] = float(pred_hier["lower"][offset])
+                    upper_decomp[pos] = float(pred_hier["upper"][offset])
+                row_aux[row_idx] = {
+                    "target_idx": target_idx_row,
+                    "prediction": pred_hier,
+                }
 
             _collect_interval_artifact(
                 art=art,
@@ -725,7 +794,7 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
                 n_bins=n_bins,
                 q=q_decomp,
                 extra={
-                    "decomp_cal_rows": cal_rows,
+                    "decomp_calibration_rows": cal_row_idx,
                     "decomp_aux_by_row": row_aux,
                 },
             )
