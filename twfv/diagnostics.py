@@ -418,11 +418,23 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
         cqr_random_state_base = int(cqr_kwargs.pop("random_state_base", 0))
 
     if "decomp" in methods_use:
-        from twfv.decomp import HierarchicalFactorSplitCP, unique_row_indices_from_flat_ijt
+        import torch
+        from twfv.decomp import run_factor_channel_conformal
 
         decomp_kwargs = dict(method_kwargs.get("decomp", {}))
         if "em_result" not in decomp_kwargs:
             raise ValueError("method_kwargs['decomp'] must include 'em_result'.")
+        decomp_em_result = decomp_kwargs["em_result"]
+        decomp_L, decomp_a2, decomp_psi, decomp_s = (
+            decomp_em_result[0], decomp_em_result[1],
+            decomp_em_result[2], decomp_em_result[3],
+        )
+        decomp_device = decomp_L.device if hasattr(decomp_L, 'device') else torch.device('cpu')
+        decomp_dtype = decomp_L.dtype if hasattr(decomp_L, 'dtype') else torch.float64
+        decomp_factor_mode = str(decomp_kwargs.get("factor_mode", "leave_target_out"))
+        decomp_score_kind = str(decomp_kwargs.get("score_kind", "standardized"))
+        decomp_alpha = float(decomp_kwargs.get("alpha", alpha))
+        Y_torch_decomp = torch.as_tensor(Y, dtype=decomp_dtype, device=decomp_device)
 
     rng = np.random.default_rng(int(seed))
     artifacts: List[Dict[str, Any]] = []
@@ -654,65 +666,29 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
             )
 
         if "decomp" in methods_use:
-            decomp_cfg = dict(decomp_kwargs)
-            em_result = decomp_cfg.pop("em_result")
-            decomp_alpha = float(decomp_cfg.pop("alpha", alpha))
-            mu_full = np.asarray(decomp_cfg.pop("mu_full", np.zeros_like(Y)), dtype=float)
-            degenerate_observed = bool(decomp_cfg.pop("degenerate_observed", True))
-            row_weights = decomp_cfg.pop("row_weights", None)
+            flat_obs = np.zeros(I * J * T, dtype=bool)
+            flat_obs[train_idx] = True
+            flat_obs[np.asarray(cal_idx, dtype=int).ravel()] = True
+            M_decomp = flat_obs.reshape(I, J, T).transpose(0, 2, 1)
+            M_decomp_t = torch.as_tensor(M_decomp, dtype=torch.bool, device=decomp_device)
 
-            hfcp = HierarchicalFactorSplitCP.from_run_em_like(
-                em_result,
+            out_decomp = run_factor_channel_conformal(
+                Y_torch_decomp, M_decomp_t,
+                decomp_L, decomp_psi, decomp_s, decomp_a2,
                 alpha=decomp_alpha,
-                **decomp_cfg,
-            )
-            cal_rows = unique_row_indices_from_flat_ijt(cal_idx, J=J, T=T)
-            flat_cal_mask = np.zeros(I * J * T, dtype=bool)
-            flat_cal_mask[np.asarray(cal_idx, dtype=int).ravel()] = True
-            M_cal = flat_cal_mask.reshape(I, J, T).transpose(0, 2, 1)
-            q_decomp = hfcp.calibrate(
-                Y_cal=Y,
-                M_cal=M_cal,
-                row_indices=cal_rows,
-                mu_cal=mu_full,
-                row_weights=row_weights,
+                factor_mode=decomp_factor_mode,
+                score_kind=decomp_score_kind,
             )
 
-            flat_test_mask = np.zeros(I * J * T, dtype=bool)
-            flat_test_mask[test_idx] = True
-            M_test = flat_test_mask.reshape(I, J, T).transpose(0, 2, 1)
+            lower_3d = out_decomp["intervals"]["lower"].cpu().detach().numpy()
+            upper_3d = out_decomp["intervals"]["upper"].cpu().detach().numpy()
 
-            lower_decomp = np.full(test_idx.shape[0], np.nan, dtype=float)
-            upper_decomp = np.full(test_idx.shape[0], np.nan, dtype=float)
-            row_aux: Dict[Tuple[int, int], Dict[str, Any]] = {}
-
-            row_to_positions: Dict[Tuple[int, int], List[int]] = {}
-            for pos, k in enumerate(test_idx.tolist()):
-                i = int(k // (J * T))
-                rem = int(k % (J * T))
-                j = int(rem // T)
-                t = int(rem % T)
-                row_to_positions.setdefault((i, t), []).append(pos)
-                row_aux.setdefault((i, t), {"channels": []})
-                row_aux[(i, t)]["channels"].append(j)
-
-            for (i, t), positions in row_to_positions.items():
-                observed_mask = ~M_test[i, t]
-                observed_y = Y[i, t, :]
-                lower_row, upper_row, aux_row = hfcp.predict_box_row(
-                    i=i,
-                    t=t,
-                    mu_row=mu_full[i, t],
-                    qhat=q_decomp,
-                    observed_y=observed_y,
-                    observed_mask=observed_mask,
-                    degenerate_observed=degenerate_observed,
-                )
-                for pos in positions:
-                    chan = int(chan_test[pos])
-                    lower_decomp[pos] = float(lower_row[chan])
-                    upper_decomp[pos] = float(upper_row[chan])
-                row_aux[(i, t)].update(aux_row=aux_row)
+            i_k = test_idx // (J * T)
+            rem_k = test_idx % (J * T)
+            j_k = rem_k // T
+            t_k = rem_k % T
+            lower_decomp = lower_3d[i_k, t_k, j_k]
+            upper_decomp = upper_3d[i_k, t_k, j_k]
 
             _collect_interval_artifact(
                 art=art,
@@ -723,11 +699,6 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
                 lower=lower_decomp,
                 upper=upper_decomp,
                 n_bins=n_bins,
-                q=q_decomp,
-                extra={
-                    "decomp_cal_rows": cal_rows,
-                    "decomp_aux_by_row": row_aux,
-                },
             )
 
         artifacts.append(art)
