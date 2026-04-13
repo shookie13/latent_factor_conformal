@@ -2649,6 +2649,7 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
     figsize: Tuple[float, float] = (11.0, 3.8),
     capsize: float = 3.0,
     x_jitter_frac: float = 0.12,
+    bold_method: Optional[str] = None,
     bar_lw: float = 3,
 ):
     """
@@ -2774,7 +2775,10 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
     fig1, ax1 = plt.subplots(figsize=figsize)
     for idx, (m, lab) in enumerate(zip(methods, labels)):
         x = centers + offsets[idx]
-        is_tmfv = str(m).lower() == "tmfv"
+        if bold_method is not None and m == bold_method:
+            bold = True
+        else:
+            bold = False
         ax1.bar(
             x,
             cov_mean[m],
@@ -2782,8 +2786,8 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
             yerr=cov_sd[m],
             capsize=capsize,
             alpha=0.85,
-            edgecolor="black" if is_tmfv else None,
-            linewidth=bar_lw if is_tmfv else 0.0,
+            edgecolor="black" if bold else None,
+            linewidth=bar_lw if bold else 0.0,
             label=f"{lab}",
         )
     alpha_line = float(alpha_target) if alpha_target is not None else float(artifacts[0].get("alpha", 0.1))
@@ -2809,7 +2813,10 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
     fig2, ax2 = plt.subplots(figsize=figsize)
     for idx, (m, lab) in enumerate(zip(methods, labels)):
         x = centers + offsets[idx]
-        is_tmfv = str(m).lower() == "tmfv"
+        if bold_method is not None and m == bold_method:
+            bold = True
+        else:
+            bold = False
         ax2.bar(
             x,
             sc_mean[m],
@@ -2817,8 +2824,8 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
             yerr=sc_sd[m],
             capsize=capsize,
             alpha=0.85,
-            edgecolor="black" if is_tmfv else None,
-            linewidth=bar_lw if is_tmfv else 0.0,
+            edgecolor="black" if bold else None,
+            linewidth=bar_lw if bold else 0.0,
             label=f"{lab}",
         )
     # Start y-axis from (min score across all methods/bins) - 1
@@ -2890,7 +2897,10 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
     fig3, ax3 = plt.subplots(figsize=figsize)
     for idx, (m, lab) in enumerate(zip(methods, labels)):
         x = xs + offsets_ch[idx]
-        is_tmfv = str(m).lower() == "tmfv"
+        if bold_method is not None and m == bold_method:
+            bold = True
+        else:
+            bold = False
         ax3.bar(
             x,
             cov_ch_mean[m],
@@ -2898,8 +2908,8 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
             yerr=cov_ch_sd[m],
             capsize=capsize,
             alpha=0.85,
-            edgecolor="black" if is_tmfv else None,
-            linewidth=bar_lw if is_tmfv else 0.0,
+            edgecolor="black" if bold else None,
+            linewidth=bar_lw if bold else 0.0,   
             label=f"{lab}",
         )
     if not show_gap and 0.0 < alpha_line < 1.0:
@@ -2923,7 +2933,10 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
     fig4, ax4 = plt.subplots(figsize=figsize)
     for idx, (m, lab) in enumerate(zip(methods, labels)):
         x = xs + offsets_ch[idx]
-        is_tmfv = str(m).lower() == "tmfv"
+        if bold_method is not None and m == bold_method:
+            bold = True
+        else:
+            bold = False
         ax4.bar(
             x,
             sc_ch_mean[m],
@@ -2931,8 +2944,8 @@ def plot_methods_by_time_and_channel_coverage_and_interval_score_aggregated(
             yerr=sc_ch_sd[m],
             capsize=capsize,
             alpha=0.85,
-            edgecolor="black" if is_tmfv else None,
-            linewidth=bar_lw if is_tmfv else 0.0,
+            edgecolor="black" if bold else None,
+            linewidth=bar_lw if bold else 0.0,
             label=f"{lab}",
         )
     # Start y-axis from (min score across all methods/channels) - 1

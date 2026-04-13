@@ -667,7 +667,7 @@ def resample_test_idx_and_collect_scaled_cp_artifacts(
 
         if "decomp" in methods_use:
             flat_obs = np.zeros(I * J * T, dtype=bool)
-            flat_obs[train_idx] = True
+            # flat_obs[train_idx] = True
             flat_obs[np.asarray(cal_idx, dtype=int).ravel()] = True
             M_decomp = flat_obs.reshape(I, J, T).transpose(0, 2, 1)
             M_decomp_t = torch.as_tensor(M_decomp, dtype=torch.bool, device=decomp_device)
